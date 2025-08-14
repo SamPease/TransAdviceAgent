@@ -43,12 +43,15 @@ def fetch_and_save(subreddit_name="Transgender_Surgeries", post_limit=20, commen
     os.makedirs("data", exist_ok=True)
 
     for i, post in enumerate(posts, 1):
+        filename = f"data/{subreddit_name}_post_{post.id}.json"
+        if os.path.exists(filename):
+            print(f"Skipping already downloaded post {i}: {post.title} (ID: {post.id})")
+            continue
         print(f"Fetching post {i}: {post.title}")
         post_dict = reddit_post_to_dict(post, comment_limit=comment_limit)
-
-        filename = f"data/{subreddit_name}_post_{post.id}.json"
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(post_dict, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
-    fetch_and_save()
+    # Increase default post_limit to 200
+    fetch_and_save(post_limit=200)
