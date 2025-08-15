@@ -1,0 +1,10 @@
+fastapi==0.116.1
+langchain==0.3.27
+langchain_anthropic==0.3.18
+langchain_chroma==0.2.5
+langchain_huggingface==0.3.1
+langgraph==0.6.5
+nest_asyncio==1.6.0
+pydantic==2.11.7
+python-dotenv==1.1.1
+tiktoken==0.11.0
