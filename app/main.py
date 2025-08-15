@@ -1,21 +1,21 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
 from .rag_pipeline import run_rag  # your existing function
 
 app = FastAPI()
 
-# --- CORS setup ---
+# --- Secure CORS setup ---
 origins = [
-    "https://sampease.github.io/",  # replace with your GitHub Pages URL
-    "http://localhost:8000",           # optional: for local testing
+    "https://sampease.github.io"  # only allow your GitHub Pages domain
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # or ["*"] to allow all origins
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["POST"],  # only allow POST since /ask is POST
     allow_headers=["*"],
 )
 # --- end CORS setup ---
@@ -34,3 +34,8 @@ async def ask(query: Query):
         import traceback
         print(traceback.format_exc())
         return {"error": str(e)}
+
+# optional: simple root route for testing
+@app.get("/")
+def read_root():
+    return {"message": "TransAdviceAgent API is running."}
