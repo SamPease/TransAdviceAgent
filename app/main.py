@@ -35,7 +35,8 @@ async def ask(query: Query):
         print(traceback.format_exc())
         return {"error": str(e)}
 
-# optional: simple root route for testing
+# --- Health check + root route ---
 @app.get("/")
+@app.head("/")   # ✅ handle Render's HEAD /
 def read_root():
     return {"message": "TransAdviceAgent API is running."}
