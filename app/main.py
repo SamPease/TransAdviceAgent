@@ -8,15 +8,15 @@ app = FastAPI()
 
 # --- Secure CORS setup ---
 origins = [
-    "https://sampease.github.io"  # only allow your GitHub Pages domain
+    "https://sampease.github.io",  # only allow your GitHub Pages domain
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_methods=["*"],   # allow GET, POST, OPTIONS, etc.
+    allow_headers=["*"],   # allow Content-Type, Authorization, etc.
 )
 # --- end CORS setup ---
 
