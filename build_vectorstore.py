@@ -1,70 +1,92 @@
 import os
 import json
-from langchain.schema import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+from langchain.docstore.document import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-PROCESSED_FILE = "processed_files.json"
+DATA_DIR = "data"
+INDEX_FILE = "app/faiss_index"
 
-def load_processed_files():
-    if os.path.exists(PROCESSED_FILE):
-        with open(PROCESSED_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
-def save_processed_files(processed_files):
-    with open(PROCESSED_FILE, "w") as f:
-        json.dump(list(processed_files), f)
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=50
+)
 
-def load_new_documents(data_dir="data", processed_files=set()):
+def load_json_files(data_dir, existing_ids=None):
+    """Load JSON files and return new Document chunks that are not in existing_ids"""
     documents = []
-    new_files = []
+    existing_ids = existing_ids or set()
+
     for filename in os.listdir(data_dir):
-        if filename.endswith(".json") and filename not in processed_files:
+        if filename.endswith(".json"):
             path = os.path.join(data_dir, filename)
             with open(path, "r", encoding="utf-8") as f:
                 post = json.load(f)
-                text_parts = [post.get("title", ""), post.get("selftext", "")]
+                post_id = post["id"]
+                if post_id in existing_ids:
+                    print(f"Skipping already indexed post {post_id}")
+                    continue
+
+                text_parts = [post["title"], post.get("selftext", "")]
                 for comment in post.get("comments", []):
                     text_parts.append(comment.get("body", ""))
-                full_text = "\n\n".join(text_parts)
+                content = "\n".join(text_parts)
                 metadata = {
-                    "post_id": post.get("id"),
-                    "author": post.get("author"),
-                    "created_utc": post.get("created_utc"),
-                    "source_file": filename,
+                    "id": post_id,
+                    "url": post["url"],
+                    "author": post["author"],
+                    "num_comments": post["num_comments"],
+                    "score": post["score"],
+                    "created_utc": post["created_utc"]
                 }
-                documents.append(Document(page_content=full_text, metadata=metadata))
-                new_files.append(filename)
-    return documents, new_files
+
+                # Split into chunks
+                chunks = text_splitter.split_text(content)
+                for chunk in chunks:
+                    documents.append(Document(page_content=chunk, metadata=metadata))
+    return documents
+
+def get_existing_post_ids(faiss_index):
+    """Return set of post IDs already in the index"""
+    ids = set()
+    for doc in faiss_index.docstore._dict.values():
+        if "id" in doc.metadata:
+            ids.add(doc.metadata["id"])
+    return ids
 
 def main():
-    processed_files = load_processed_files()
-    print(f"Previously processed files: {len(processed_files)}")
+    # Load existing index if it exists
+    if os.path.exists(INDEX_FILE):
+        print(f"Loading existing FAISS index from {INDEX_FILE}")
+        faiss_index = FAISS.load_local(INDEX_FILE, embedding_model)
+        existing_ids = get_existing_post_ids(faiss_index)
+    else:
+        print("Creating new FAISS index")
+        faiss_index = None
+        existing_ids = set()
 
-    new_docs, new_files = load_new_documents(processed_files=processed_files)
-    print(f"New documents to process: {len(new_docs)}")
+    # Load new documents
+    new_docs = load_json_files(DATA_DIR, existing_ids=existing_ids)
+    print(f"Found {len(new_docs)} new document chunks")
 
     if not new_docs:
-        print("No new documents to process.")
+        print("No new documents to add. Exiting.")
         return
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    chunks = text_splitter.split_documents(new_docs)
-    print(f"Split new docs into {len(chunks)} chunks.")
+    # Add to index
+    if faiss_index:
+        faiss_index.add_documents(new_docs)
+    else:
+        faiss_index = FAISS.from_documents(new_docs, embedding_model)
 
-    embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectordb = Chroma(persist_directory="chroma_db", embedding_function=embedding_model)
-
-    vectordb.add_documents(chunks)
-
-    print("Vectorstore updated and persisted.")
-
-    processed_files.update(new_files)
-    save_processed_files(processed_files)
-    print(f"Processed files updated: {len(processed_files)}")
-
+    # Save updated index
+    faiss_index.save_local(INDEX_FILE)
+    print(f"FAISS index updated and saved to {INDEX_FILE}")
 
 if __name__ == "__main__":
     main()
