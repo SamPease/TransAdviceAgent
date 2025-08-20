@@ -15,7 +15,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["POST"],  # only allow POST since /ask is POST
+    allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
 )
 # --- end CORS setup ---
