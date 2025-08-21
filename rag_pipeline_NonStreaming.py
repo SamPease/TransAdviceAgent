@@ -135,61 +135,59 @@ async def retrieve_node(state):
     query = state["query"]
     vectorstore = get_vectorstore()
 
-    # Query embedding
+    # Step 1: compute query embedding
     query_emb = _embedding_model.embed_query(query)
 
-    # Initial FAISS search (IDs only)
+    # Step 2: FAISS search
     D, I = vectorstore.index.search(np.array([query_emb], dtype=np.float32), DOCS_FETCH_LIMIT)
-    candidate_indices = I[0].tolist()
-    candidate_doc_ids = [
-        vectorstore.index_to_docstore_id[idx]
-        for idx in candidate_indices if idx in vectorstore.index_to_docstore_id
-    ]
+    candidate_indices = I[0].tolist()  # numeric positions in FAISS
+
+    # Step 3: map numeric indices to docstore IDs (UUIDs)
+    candidate_doc_ids = [vectorstore.index_to_docstore_id[idx] for idx in candidate_indices
+                         if idx in vectorstore.index_to_docstore_id]
 
     if not candidate_doc_ids:
-        return {"doc_ids": [], "metadata_map": {}, "query": query}
+        return {
+            "doc_ids": [],
+            "metadata_map": {},
+            "query": query
+        }
 
-    # ---- Memory-efficient MMR ----
+    # Optional: MMR selection using embeddings
+    candidate_embeddings = np.array([vectorstore.index.reconstruct(int(idx)) for idx in candidate_indices])
+    sim_to_query = cosine_similarity([query_emb], candidate_embeddings)[0]
+
     lambda_mult = 0.7
     k = min(DOCS_KEEP_LIMIT, len(candidate_doc_ids))
-
     selected_doc_ids = []
-    selected_embs = []
 
-    # Seed with best match
-    best_idx = candidate_indices[0]
-    selected_doc_ids.append(vectorstore.index_to_docstore_id[best_idx])
-    selected_embs.append(vectorstore.index.reconstruct(best_idx))
+    remaining_ids = candidate_doc_ids.copy()
+    remaining_embeddings = candidate_embeddings.copy()
+    selected_idx = int(np.argmax(sim_to_query))
+    selected_doc_ids.append(remaining_ids[selected_idx])
 
-    # Remove it from candidates
-    remaining = [(idx, doc_id) for idx, doc_id in zip(candidate_indices, candidate_doc_ids)
-                 if doc_id not in selected_doc_ids]
+    selected_embeddings = [remaining_embeddings[selected_idx]]
+    del remaining_ids[selected_idx]
+    remaining_embeddings = np.delete(remaining_embeddings, selected_idx, axis=0)
 
-    # Incrementally select with MMR
-    while len(selected_doc_ids) < k and remaining:
-        scores = []
-        for idx, doc_id in remaining:
-            emb = vectorstore.index.reconstruct(idx)
-            sim_to_query = cosine_similarity([query_emb], [emb])[0][0]
-            sim_to_selected = max(
-                cosine_similarity([emb], selected_embs)[0]
-            )
-            mmr_score = lambda_mult * sim_to_query - (1 - lambda_mult) * sim_to_selected
-            scores.append((mmr_score, idx, doc_id, emb))
+    while len(selected_doc_ids) < k and remaining_ids:
+        sim_to_query = cosine_similarity([query_emb], remaining_embeddings)[0]
+        sim_to_selected = cosine_similarity(remaining_embeddings, selected_embeddings).max(axis=1)
+        mmr_score = lambda_mult * sim_to_query - (1 - lambda_mult) * sim_to_selected
+        next_idx = int(np.argmax(mmr_score))
+        selected_doc_ids.append(remaining_ids[next_idx])
+        selected_embeddings.append(remaining_embeddings[next_idx])
+        del remaining_ids[next_idx]
+        remaining_embeddings = np.delete(remaining_embeddings, next_idx, axis=0)
 
-        # Pick best
-        _, idx, doc_id, emb = max(scores, key=lambda x: x[0])
-        selected_doc_ids.append(doc_id)
-        selected_embs.append(emb)
-        remaining = [(i, d) for (i, d) in remaining if d != doc_id]
+    # Step 4: build metadata map for selected docs
+    metadata_map = {doc_id: vectorstore.docstore._dict[doc_id].metadata for doc_id in selected_doc_ids}
 
-    metadata_map = {
-        doc_id: vectorstore.docstore._dict[doc_id].metadata
-        for doc_id in selected_doc_ids if doc_id in vectorstore.docstore._dict
+    return {
+        "doc_ids": selected_doc_ids,
+        "metadata_map": metadata_map,
+        "query": query
     }
-
-    return {"doc_ids": selected_doc_ids, "metadata_map": metadata_map, "query": query}
-
 
 async def summarize_node(state):
     doc_ids = state["doc_ids"]
@@ -203,32 +201,34 @@ async def summarize_node(state):
 
     vectorstore = get_vectorstore()
     llm = get_llm(streaming=False)
-
-    # Stream summaries level by level
     level_summaries = []
 
     for i in range(0, len(doc_ids), DOC_BATCH_SIZE):
         batch_ids = doc_ids[i:i + DOC_BATCH_SIZE]
 
-        # Lazy fetch docs
+        # Lazy load documents for this batch only
         batch_docs = vectorstore.get_by_ids(batch_ids)
         if not batch_docs:
             continue
 
-        # Summarize immediately and discard
         summary = await summarize_batch(batch_docs, llm, state["query"])
         level_summaries.append(summary)
-        del batch_docs  # free memory
 
-    # Iterative reduction — process in small batches
+    if not level_summaries:
+        return {
+            "final_answer": "No summaries could be generated.",
+            "query": state["query"],
+            "used_doc_ids": doc_ids,
+            "metadata_map": state.get("metadata_map")
+        }
+
+    # Recursive reduce summaries
     while len(level_summaries) > 1:
         next_level = []
         for i in range(0, len(level_summaries), SUMMARY_BATCH_SIZE):
             batch = level_summaries[i:i + SUMMARY_BATCH_SIZE]
-            prompt = reduce_prompt.format(
-                question=state["query"],
-                summaries="\n\n".join(batch)
-            )
+            batch_text = "\n\n".join(batch)
+            prompt = reduce_prompt.format(question=state["query"], summaries=batch_text)
             result = await llm.ainvoke(prompt)
             next_level.append(result.content)
         level_summaries = next_level
@@ -245,7 +245,6 @@ async def summarize_node(state):
         "used_doc_ids": doc_ids,
         "metadata_map": state.get("metadata_map")
     }
-
 
 
 async def output_node(state):
