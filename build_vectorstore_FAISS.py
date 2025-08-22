@@ -1,18 +1,13 @@
 import os
 import json
-import sqlite3
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 DATA_DIR = "data"
-INDEX_DIR = "app/faiss_index"
-SQLITE_PATH = os.path.join(INDEX_DIR, "docs.sqlite")
+INDEX_FILE = "app/faiss_index"
 
-# --------------------------
-# Embeddings and text splitting
-# --------------------------
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
@@ -22,39 +17,8 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_overlap=50
 )
 
-# --------------------------
-# SQLite docstore utilities
-# --------------------------
-def init_sqlite(db_path):
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS docs (
-        id TEXT PRIMARY KEY,
-        content TEXT,
-        metadata TEXT
-    )
-    """)
-    conn.commit()
-    return conn
-
-def insert_documents(conn, documents):
-    for doc in documents:
-        doc_id = doc.metadata.get("id") or os.urandom(8).hex()
-        conn.execute(
-            "INSERT OR REPLACE INTO docs (id, content, metadata) VALUES (?, ?, ?)",
-            (doc_id, doc.page_content, json.dumps(doc.metadata))
-        )
-    conn.commit()
-
-def get_existing_ids(conn):
-    rows = conn.execute("SELECT id FROM docs").fetchall()
-    return set(r[0] for r in rows)
-
-# --------------------------
-# Load JSON and create document chunks
-# --------------------------
 def load_json_files(data_dir, existing_ids=None):
+    """Load JSON files and return new Document chunks that are not in existing_ids"""
     documents = []
     existing_ids = existing_ids or set()
 
@@ -87,37 +51,42 @@ def load_json_files(data_dir, existing_ids=None):
                     documents.append(Document(page_content=chunk, metadata=metadata))
     return documents
 
-# --------------------------
-# Main processing
-# --------------------------
+def get_existing_post_ids(faiss_index):
+    """Return set of post IDs already in the index"""
+    ids = set()
+    for doc in faiss_index.docstore._dict.values():
+        if "id" in doc.metadata:
+            ids.add(doc.metadata["id"])
+    return ids
+
 def main():
-    os.makedirs(INDEX_DIR, exist_ok=True)
-    conn = init_sqlite(SQLITE_PATH)
+    # Load existing index if it exists
+    if os.path.exists(INDEX_FILE):
+        print(f"Loading existing FAISS index from {INDEX_FILE}")
+        faiss_index = FAISS.load_local(INDEX_FILE, embedding_model)
+        existing_ids = get_existing_post_ids(faiss_index)
+    else:
+        print("Creating new FAISS index")
+        faiss_index = None
+        existing_ids = set()
 
-    existing_ids = get_existing_ids(conn)
-    print(f"{len(existing_ids)} documents already in SQL docstore")
-
-    new_docs = load_json_files(DATA_DIR, existing_ids)
+    # Load new documents
+    new_docs = load_json_files(DATA_DIR, existing_ids=existing_ids)
     print(f"Found {len(new_docs)} new document chunks")
 
     if not new_docs:
         print("No new documents to add. Exiting.")
         return
 
-    # Insert documents into SQLite
-    insert_documents(conn, new_docs)
-
-    # Build or update FAISS index
-    if os.path.exists(os.path.join(INDEX_DIR, "index.faiss")):
-        faiss_index = FAISS.load_local(INDEX_DIR, embedding_model, allow_dangerous_deserialization=True)
+    # Add to index
+    if faiss_index:
         faiss_index.add_documents(new_docs)
-        print("Updated existing FAISS index")
     else:
         faiss_index = FAISS.from_documents(new_docs, embedding_model)
-        print("Created new FAISS index")
 
-    faiss_index.save_local(INDEX_DIR)
-    print(f"FAISS index saved to {INDEX_DIR}")
+    # Save updated index
+    faiss_index.save_local(INDEX_FILE)
+    print(f"FAISS index updated and saved to {INDEX_FILE}")
 
 if __name__ == "__main__":
     main()
