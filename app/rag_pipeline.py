@@ -42,7 +42,7 @@ def get_embedding_model():
 # Configurable parameters
 # --------------------------
 MODEL_NAME = "claude-3-5-haiku-latest"
-DOC_BATCH_SIZE = 20          # how many docs to fetch from FAISS per summarization step
+DOC_BATCH_SIZE = 10          # how many docs to fetch from FAISS per summarization step
 SUMMARY_BATCH_SIZE = 10      # how many summaries to reduce at once
 DOCS_FETCH_LIMIT = 200       # how many docs to pull from FAISS in initial search
 DOCS_KEEP_LIMIT = 100        # how many docs to keep after reranking
