@@ -13,6 +13,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain.prompts import PromptTemplate
 from langgraph.graph import StateGraph, END
+from langsmith import Client
 
 # For debugging/profiling (commented out)
 # import psutil
@@ -41,7 +42,7 @@ def get_embedding_model():
 # Configurable parameters
 # --------------------------
 MODEL_NAME = "claude-3-5-haiku-latest"
-DOC_BATCH_SIZE = 10          # how many docs to fetch from FAISS per summarization step
+DOC_BATCH_SIZE = 20          # how many docs to fetch from FAISS per summarization step
 SUMMARY_BATCH_SIZE = 10      # how many summaries to reduce at once
 DOCS_FETCH_LIMIT = 200       # how many docs to pull from FAISS in initial search
 DOCS_KEEP_LIMIT = 100        # how many docs to keep after reranking
@@ -50,48 +51,10 @@ VECTORSTORE_PATH = "./app/vectorstore"  # path to FAISS index directory
 # --------------------------
 # Prompts
 # --------------------------
-map_prompt = PromptTemplate(
-    input_variables=["question", "context"],
-    template="""
-You are an assistant reading documents to answer a question.
-Question: {question}
-
-Read the following documents carefully and produce a concise summary that captures all key information relevant to the question. 
-
-Documents:
-{context}
-
-Summary:
-"""
-)
-
-reduce_prompt = PromptTemplate(
-    input_variables=["question", "summaries"],
-    template="""
-You are an assistant tasked with combining summaries into a single, coherent summary. 
-
-Question: {question}
-
-Batch summaries:
-{summaries}
-
-Combined summary:
-"""
-)
-
-final_prompt = PromptTemplate(
-    input_variables=["question", "final_summary"],
-    template="""
-You are an expert assistant. Using the following summary, answer the question as accurately and clearly as possible.
-
-Question: {question}
-
-Summary:
-{final_summary}
-
-Answer:
-"""
-)
+client = Client()
+map_prompt = client.pull_prompt("map_prompt", include_model=True)
+reduce_prompt = client.pull_prompt("reduce_prompt", include_model=True)
+final_prompt = client.pull_prompt("final_prompt", include_model=True)
 
 # --------------------------
 # Streaming callback (optional)
@@ -183,10 +146,14 @@ def get_llm(streaming=False):
 #     mem = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
 #     print(f"[MEMORY] {tag}: {mem:.2f} MB")
 
-async def summarize_batch(batch: List[Document], llm, question: str) -> str:
+async def summarize_batch(batch: List[Document], question: str) -> str:
     batch_text = "\n\n".join(doc.page_content for doc in batch)
-    prompt = map_prompt.format(question=question, context=batch_text)
-    result = await llm.ainvoke(prompt)
+    result = await map_prompt.ainvoke({"question": question, "context": batch_text})
+    return result.content
+
+async def reduce_batch(batch: List[str], question: str) -> str:
+    batch_text = "\n\n".join(batch)
+    result = await reduce_prompt.ainvoke({"question": question, "summaries": batch_text})
     return result.content
 
 
@@ -206,29 +173,10 @@ async def retrieve_node(state):
     query = state["query"]
     vectorstore = get_vectorstore()
 
-    # Debug: Check SQLite contents
-    print("\n[DEBUG][retrieve] Checking SQLite database contents...")
+    # Quick DB check
     conn = sqlite3.connect(VECTORSTORE_PATH + "/docs.sqlite")
-    
-    # Get total counts
     doc_count = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
-    parent_count = conn.execute(
-        "SELECT COUNT(DISTINCT json_extract(metadata, '$.parent_id')) FROM docs"
-    ).fetchone()[0]
-    print(f"[DEBUG][retrieve] Total chunks in SQLite: {doc_count}")
-    print(f"[DEBUG][retrieve] Total unique parent posts: {parent_count}")
-    
-    # Sample some documents
-    sample_docs = conn.execute("SELECT id, metadata FROM docs LIMIT 5").fetchall()
-    print(f"\n[DEBUG][retrieve] Sample docs in SQLite:")
-    for doc_id, metadata_json in sample_docs:
-        metadata = json.loads(metadata_json)
-        parent_id = metadata.get('parent_id', 'N/A')
-        chunk_index = metadata.get('chunk_index', 'N/A')
-        total_chunks = metadata.get('total_chunks', 'N/A')
-        print(f"  - Chunk ID: {doc_id}")
-        print(f"    Parent Post: {parent_id}")
-        print(f"    Chunk {chunk_index} of {total_chunks}")
+    print(f"[INFO] Found {doc_count} documents in database")
     conn.close()
 
     # Load id_map for document lookup
@@ -238,40 +186,21 @@ async def retrieve_node(state):
     # Generate query embedding and search
     query_emb = get_embedding_model().embed_query(query)
     D, I = vectorstore.index.search(np.array([query_emb], dtype=np.float32), DOCS_FETCH_LIMIT)
-    print(f"[DEBUG][retrieve] FAISS search complete. Top 3 distances: {D[0][:3]}")
     candidate_indices = I[0].tolist()
-    print(f"[DEBUG][retrieve] Found {len(candidate_indices)} candidate indices")
+    print(f"[INFO] Initial search found {len(candidate_indices)} relevant documents")
 
-    # First verify which documents exist in SQLite
-    print("\n[DEBUG][retrieve] Verifying document existence in SQLite...")
+    # Verify document existence
     conn = sqlite3.connect(VECTORSTORE_PATH + "/docs.sqlite")
-    existing_ids = set()
-    for row in conn.execute("SELECT id FROM docs").fetchall():
-        existing_ids.add(row[0])
-    print(f"[DEBUG][retrieve] Found {len(existing_ids)} documents in SQLite")
-
-    # Load id mapping explicitly to ensure we have the latest version
-    with open(VECTORSTORE_PATH + "/id_map.json") as f:
-        id_map = json.load(f)
-    print(f"[DEBUG][retrieve] Loaded id_map with {len(id_map)} entries")
+    existing_ids = set(row[0] for row in conn.execute("SELECT id FROM docs").fetchall())
 
     # Map FAISS indices to document IDs
     candidate_doc_ids = []
-    valid_id_map = {k: v for k, v in id_map.items() if v in existing_ids}
-    print(f"[DEBUG][retrieve] {len(valid_id_map)} of {len(id_map)} mappings point to existing documents")
-    
     for idx in candidate_indices:
-        key = str(idx)  # id_map uses string keys
-        if key in id_map:
-            doc_id = id_map[key]
-            candidate_doc_ids.append(doc_id)
-            # print(f"[DEBUG][retrieve] Mapped index {idx} to doc_id {doc_id}")
-        else:
-            print(f"[WARN] No mapping found for FAISS index {idx}")
-    print(f"[DEBUG][retrieve] Mapped to {len(candidate_doc_ids)} valid doc IDs")
-    if len(candidate_doc_ids) != len(candidate_indices):
-        print(f"[DEBUG][retrieve] WARNING: {len(candidate_indices) - len(candidate_doc_ids)} indices had no matching doc IDs")
-        print(f"[DEBUG][retrieve] First few missing indices: {[idx for idx in candidate_indices[:10] if idx not in vectorstore.index_to_docstore_id]}")
+        key = str(idx)
+        if key in id_map and id_map[key] in existing_ids:
+            candidate_doc_ids.append(id_map[key])
+    
+    print(f"[INFO] Found {len(candidate_doc_ids)} valid documents to process")
 
     if not candidate_doc_ids:
         print("[DEBUG][retrieve] No valid document IDs found!")
@@ -339,6 +268,7 @@ async def retrieve_node(state):
 async def summarize_node(state):
     doc_ids = state["doc_ids"]
     if not doc_ids:
+        print("[INFO] No relevant documents found for query")
         return {
             "final_answer": "No documents found for this query.",
             "query": state["query"],
@@ -346,8 +276,11 @@ async def summarize_node(state):
             "metadata_map": {}
         }
 
+    print(f"\n[INFO] Starting summarization process for {len(doc_ids)} documents")
+    print(f"[INFO] Using batch size of {DOC_BATCH_SIZE} for initial summarization")
+    
     vectorstore = get_vectorstore()
-    llm = get_llm(streaming=False)
+    # llm = get_llm(streaming=False)
 
     level_summaries = []
 
@@ -361,52 +294,60 @@ async def summarize_node(state):
         current_task = asyncio.to_thread(vectorstore.docstore.get_by_ids, batch_ids)
         next_batch_start += DOC_BATCH_SIZE
 
-    batch_index = 1
-    while current_task:
-        # Wait for the current batch to load
-        batch_docs = await current_task
-
-        # Start prefetching next batch if available
-        if next_batch_start < len(doc_ids):
-            batch_ids = doc_ids[next_batch_start:next_batch_start + DOC_BATCH_SIZE]
-            next_task = asyncio.to_thread(vectorstore.docstore.get_by_ids, batch_ids)
-            next_batch_start += DOC_BATCH_SIZE
-        else:
-            next_task = None
-
-        # Summarize current batch
-        summary = await summarize_batch(batch_docs, llm, state["query"])
-        level_summaries.append(summary)
-
-        del batch_docs
-        batch_index += 1
-
-        # Move to next batch
-        current_task = next_task
+    # Create coroutines for document loading
+    async def load_batch(batch_ids):
+        return await asyncio.to_thread(vectorstore.docstore.get_by_ids, batch_ids)
+    
+    # Setup parallel document loading
+    doc_batches = []
+    for i in range(0, len(doc_ids), DOC_BATCH_SIZE):
+        batch_ids = doc_ids[i:i + DOC_BATCH_SIZE]
+        doc_batches.append(load_batch(batch_ids))
+    
+    # Wait for all document batches to load
+    print(f"[INFO] Loading {len(doc_batches)} document batches in parallel")
+    loaded_batches = await asyncio.gather(*doc_batches)
+    
+    # Summarize all batches in parallel
+    print(f"[INFO] Starting parallel summarization of {len(loaded_batches)} batches")
+    summarization_tasks = []
+    for batch_index, batch_docs in enumerate(loaded_batches, 1):
+        print(f"[INFO] Queuing batch {batch_index} ({len(batch_docs)} documents)")
+        summarization_tasks.append(summarize_batch(batch_docs, state["query"]))
+    
+    # Wait for all summaries
+    level_summaries = await asyncio.gather(*summarization_tasks)
+    print(f"[INFO] Completed parallel summarization of {len(level_summaries)} batches")
 
     # --------------------------
     # Iterative reduction of summaries
     # --------------------------
+    reduction_round = 1
     while len(level_summaries) > 1:
-        next_level = []
+        print(f"\n[INFO] Starting reduction round {reduction_round}")
+        print(f"[INFO] Combining {len(level_summaries)} summaries in batches of {SUMMARY_BATCH_SIZE}")
+        
+        # Process reduction batches in parallel
+        reduction_tasks = []
         for i in range(0, len(level_summaries), SUMMARY_BATCH_SIZE):
             batch = level_summaries[i:i + SUMMARY_BATCH_SIZE]
-            prompt = reduce_prompt.format(
-                question=state["query"],
-                summaries="\n\n".join(batch)
-            )
-            result = await llm.ainvoke(prompt)
-            next_level.append(result.content)
+            reduction_tasks.append(reduce_batch(batch, state["query"]))
+        
+        # Wait for all reductions to complete
+        results = await asyncio.gather(*reduction_tasks)
+        next_level = results
+            
+        print(f"[INFO] Reduction round {reduction_round} complete. Summaries reduced from {len(level_summaries)} to {len(next_level)}")
         level_summaries = next_level
+        reduction_round += 1
 
     # --------------------------
     # Final answer generation
     # --------------------------
-    final_prompt_text = final_prompt.format(
-        question=state["query"],
-        final_summary=level_summaries[0]
-    )
-    final_answer = await llm.ainvoke(final_prompt_text)
+    print("\n[INFO] Generating final answer from consolidated summary")
+
+    final_answer = await final_prompt.ainvoke({"question": state["query"], "final_summary": level_summaries[0]})
+    print("[INFO] Answer generation complete")
 
     return {
         "final_answer": final_answer.content,  # Extract the content from AIMessage
