@@ -1,19 +1,22 @@
 import asyncio
+import json
+import os
+import sqlite3
 from typing import TypedDict, List
+
+import numpy as np
+import faiss
+from dotenv import load_dotenv
 from langchain.schema import Document
 from langchain_anthropic import ChatAnthropic
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain.prompts import PromptTemplate
 from langgraph.graph import StateGraph, END
-from dotenv import load_dotenv
-from sklearn.metrics.pairwise import cosine_similarity
-from faiss import read_index
-import numpy as np
-import os
-import psutil
-import sqlite3
-import faiss, json
+
+# For debugging/profiling (commented out)
+# import psutil
+# from sklearn.metrics.pairwise import cosine_similarity
 
 # Load env variables
 load_dotenv()
@@ -176,22 +179,14 @@ def get_llm(streaming=False):
 # --------------------------
 # Utilities
 # --------------------------
-def log_memory(tag=""):
-    mem = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
-    print(f"[MEMORY] {tag}: {mem:.2f} MB")
+# def log_memory(tag=""):
+#     mem = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+#     print(f"[MEMORY] {tag}: {mem:.2f} MB")
 
 async def summarize_batch(batch: List[Document], llm, question: str) -> str:
-    # Use a generator to build the batch text to avoid holding full string in memory
-    def batch_text_gen():
-        for i, doc in enumerate(batch):
-            if i > 0:
-                yield "\n\n"
-            yield doc.page_content
-    
-    batch_text = "".join(batch_text_gen())
+    batch_text = "\n\n".join(doc.page_content for doc in batch)
     prompt = map_prompt.format(question=question, context=batch_text)
     result = await llm.ainvoke(prompt)
-    del batch_text  # Free memory immediately
     return result.content
 
 
@@ -236,23 +231,12 @@ async def retrieve_node(state):
         print(f"    Chunk {chunk_index} of {total_chunks}")
     conn.close()
 
-    # Debug: Check id_map contents
+    # Load id_map for document lookup
     with open(VECTORSTORE_PATH + "/id_map.json") as f:
         id_map = json.load(f)
-    print(f"[DEBUG][retrieve] Total entries in id_map: {len(id_map)}")
-    print("[DEBUG][retrieve] First few id_map entries:")
-    for idx, doc_id in list(id_map.items())[:5]:
-        print(f"  - FAISS idx: {idx} -> doc_id: {doc_id}")
 
-    log_memory("before retrieval")
-
-    # Query embedding using singleton model
-    print("[DEBUG][retrieve] Generating query embedding...")
+    # Generate query embedding and search
     query_emb = get_embedding_model().embed_query(query)
-    print(f"[DEBUG][retrieve] Query embedding generated, shape={len(query_emb)}")
-
-    # Initial FAISS search (IDs only)
-    print(f"[DEBUG][retrieve] Searching FAISS index for top {DOCS_FETCH_LIMIT} matches...")
     D, I = vectorstore.index.search(np.array([query_emb], dtype=np.float32), DOCS_FETCH_LIMIT)
     print(f"[DEBUG][retrieve] FAISS search complete. Top 3 distances: {D[0][:3]}")
     candidate_indices = I[0].tolist()
@@ -309,7 +293,6 @@ async def retrieve_node(state):
     selected_indices.append(best_idx)
     selected_doc_ids.append(best_doc_id)
     selected_embs.append(vectorstore.index.reconstruct(best_idx))
-    print(f"[DEBUG][retrieve] Seed document: index={best_idx}, doc_id={best_doc_id}")
 
     # Remove it from candidates
     remaining = [(idx, id_map[str(idx)]) for idx in candidate_indices[1:]
@@ -319,15 +302,14 @@ async def retrieve_node(state):
         scores = []
         for idx, doc_id in remaining:
             emb = vectorstore.index.reconstruct(idx)
-            sim_to_query = cosine_similarity([query_emb], [emb])[0][0]
-            sim_to_selected = max(
-                cosine_similarity([emb], selected_embs)[0]
-            )
+            # Use numpy operations for similarity calculations
+            sim_to_query = np.dot(query_emb, emb) / (np.linalg.norm(query_emb) * np.linalg.norm(emb))
+            sim_to_selected = max(np.dot(emb, sel_emb) / (np.linalg.norm(emb) * np.linalg.norm(sel_emb))
+                                for sel_emb in selected_embs)
             mmr_score = lambda_mult * sim_to_query - (1 - lambda_mult) * sim_to_selected
             scores.append((mmr_score, idx, doc_id, emb))
         
         if not scores:
-            print("[DEBUG][retrieve] No more valid candidates for MMR")
             break
             
         _, idx, doc_id, emb = max(scores, key=lambda x: x[0])
@@ -350,7 +332,7 @@ async def retrieve_node(state):
         else:
             print(f"[WARN] Could not find document {doc_id} in SQLite")
 
-    log_memory("after retrieval")
+    # log_memory("after retrieval")
     return {"doc_ids": selected_doc_ids, "metadata_map": metadata_map, "query": query}
 
 
@@ -368,8 +350,6 @@ async def summarize_node(state):
     llm = get_llm(streaming=False)
 
     level_summaries = []
-
-    log_memory("before summarization")
 
     # --------------------------
     # Prefetch first batch asynchronously
@@ -399,7 +379,6 @@ async def summarize_node(state):
         level_summaries.append(summary)
 
         del batch_docs
-        log_memory(f"after summarization batch {batch_index}")
         batch_index += 1
 
         # Move to next batch
@@ -428,8 +407,6 @@ async def summarize_node(state):
         final_summary=level_summaries[0]
     )
     final_answer = await llm.ainvoke(final_prompt_text)
-
-    log_memory("after final summarization")
 
     return {
         "final_answer": final_answer,
