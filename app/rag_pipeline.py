@@ -3,19 +3,36 @@ from typing import TypedDict, List
 from langchain.schema import Document
 from langchain_anthropic import ChatAnthropic
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain.prompts import PromptTemplate
 from langgraph.graph import StateGraph, END
 from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
+from faiss import read_index
 import numpy as np
 import os
 import psutil
 import sqlite3
-import json
+import faiss, json
 
 # Load env variables
 load_dotenv()
+
+# --------------------------
+# Global model instance
+# --------------------------
+_embedding_model = None
+
+def get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = HuggingFaceEndpointEmbeddings(
+                model="sentence-transformers/all-MiniLM-L6-v2",
+                )
+
+    return _embedding_model
+
+
 
 # --------------------------
 # Configurable parameters
@@ -25,6 +42,7 @@ DOC_BATCH_SIZE = 10          # how many docs to fetch from FAISS per summarizati
 SUMMARY_BATCH_SIZE = 10      # how many summaries to reduce at once
 DOCS_FETCH_LIMIT = 200       # how many docs to pull from FAISS in initial search
 DOCS_KEEP_LIMIT = 100        # how many docs to keep after reranking
+VECTORSTORE_PATH = "./app/vectorstore"  # path to FAISS index directory
 
 # --------------------------
 # Prompts
@@ -80,11 +98,6 @@ class StreamingPrintHandler(BaseCallbackHandler):
     def on_llm_new_token(self, token: str, **kwargs) -> None:
         print(token, end="", flush=True)
 
-# --------------------------
-# Global cached models
-# --------------------------
-_embedding_model = None
-_vectorstore = None
 
 # --------------------------
 # SQLite docstore
@@ -105,15 +118,24 @@ class SQLiteDocstore:
     def get_by_ids(self, ids: List[str]) -> List[Document]:
         docs = []
         with self.lock:
+            # Use a single query with IN clause for better performance
+            placeholders = ','.join('?' * len(ids))
+            rows = self.conn.execute(
+                f"SELECT content, metadata FROM docs WHERE id IN ({placeholders})",
+                ids
+            ).fetchall()
+            
+            # Create a mapping for faster lookup
+            row_map = {json.loads(metadata)["id"]: (content, metadata) 
+                      for content, metadata in rows}
+            
+            # Maintain order of requested ids
             for doc_id in ids:
-                row = self.conn.execute(
-                    "SELECT content, metadata FROM docs WHERE id=?",
-                    (doc_id,)
-                ).fetchone()
-                if row:
-                    content, metadata_json = row
+                if doc_id in row_map:
+                    content, metadata_json = row_map[doc_id]
                     metadata = json.loads(metadata_json)
                     docs.append(Document(page_content=content, metadata=metadata))
+                    
         return docs
 
     def insert_documents(self, documents: List[Document]):
@@ -128,25 +150,19 @@ class SQLiteDocstore:
             self.conn.commit()
 
 def get_vectorstore():
-    global _embedding_model, _vectorstore
-    if _embedding_model is None:
-        _embedding_model = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
+    # Use memory-mapped IO for FAISS index
+    index = faiss.read_index(VECTORSTORE_PATH + "/index.faiss", faiss.IO_FLAG_MMAP)
 
-    if _vectorstore is None:
-        faiss_path = "./app/faiss_index"
-        if os.path.exists(faiss_path + "/index.faiss"):
-            _vectorstore = FAISS.load_local(
-                faiss_path,
-                _embedding_model,
-                allow_dangerous_deserialization=True
-            )
-            # attach SQLite-backed docstore instead of loading index.pkl
-            _vectorstore.docstore = SQLiteDocstore("./app/faiss_index/docs.sqlite")
-        else:
-            raise RuntimeError("FAISS index not found. Please build it first.")
-    return _vectorstore
+    with open(VECTORSTORE_PATH + "/id_map.json") as f:
+        id_map = json.load(f)
+
+    # Use the singleton embedding model
+    return FAISS(
+        embedding_function=get_embedding_model(),  # Use stable singleton
+        index=index,
+        docstore=SQLiteDocstore(VECTORSTORE_PATH + "/docs.sqlite"),
+        index_to_docstore_id=id_map,
+    )
 
 def get_llm(streaming=False):
     callbacks = [StreamingPrintHandler()] if streaming else []
@@ -165,10 +181,19 @@ def log_memory(tag=""):
     print(f"[MEMORY] {tag}: {mem:.2f} MB")
 
 async def summarize_batch(batch: List[Document], llm, question: str) -> str:
-    batch_text = "\n\n".join(doc.page_content for doc in batch)
+    # Use a generator to build the batch text to avoid holding full string in memory
+    def batch_text_gen():
+        for i, doc in enumerate(batch):
+            if i > 0:
+                yield "\n\n"
+            yield doc.page_content
+    
+    batch_text = "".join(batch_text_gen())
     prompt = map_prompt.format(question=question, context=batch_text)
     result = await llm.ainvoke(prompt)
+    del batch_text  # Free memory immediately
     return result.content
+
 
 # --------------------------
 # State definition
@@ -186,37 +211,109 @@ async def retrieve_node(state):
     query = state["query"]
     vectorstore = get_vectorstore()
 
+    # Debug: Check SQLite contents
+    print("\n[DEBUG][retrieve] Checking SQLite database contents...")
+    conn = sqlite3.connect(VECTORSTORE_PATH + "/docs.sqlite")
+    
+    # Get total counts
+    doc_count = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+    parent_count = conn.execute(
+        "SELECT COUNT(DISTINCT json_extract(metadata, '$.parent_id')) FROM docs"
+    ).fetchone()[0]
+    print(f"[DEBUG][retrieve] Total chunks in SQLite: {doc_count}")
+    print(f"[DEBUG][retrieve] Total unique parent posts: {parent_count}")
+    
+    # Sample some documents
+    sample_docs = conn.execute("SELECT id, metadata FROM docs LIMIT 5").fetchall()
+    print(f"\n[DEBUG][retrieve] Sample docs in SQLite:")
+    for doc_id, metadata_json in sample_docs:
+        metadata = json.loads(metadata_json)
+        parent_id = metadata.get('parent_id', 'N/A')
+        chunk_index = metadata.get('chunk_index', 'N/A')
+        total_chunks = metadata.get('total_chunks', 'N/A')
+        print(f"  - Chunk ID: {doc_id}")
+        print(f"    Parent Post: {parent_id}")
+        print(f"    Chunk {chunk_index} of {total_chunks}")
+    conn.close()
+
+    # Debug: Check id_map contents
+    with open(VECTORSTORE_PATH + "/id_map.json") as f:
+        id_map = json.load(f)
+    print(f"[DEBUG][retrieve] Total entries in id_map: {len(id_map)}")
+    print("[DEBUG][retrieve] First few id_map entries:")
+    for idx, doc_id in list(id_map.items())[:5]:
+        print(f"  - FAISS idx: {idx} -> doc_id: {doc_id}")
+
     log_memory("before retrieval")
 
-    # Query embedding
-    query_emb = _embedding_model.embed_query(query)
+    # Query embedding using singleton model
+    print("[DEBUG][retrieve] Generating query embedding...")
+    query_emb = get_embedding_model().embed_query(query)
+    print(f"[DEBUG][retrieve] Query embedding generated, shape={len(query_emb)}")
 
     # Initial FAISS search (IDs only)
+    print(f"[DEBUG][retrieve] Searching FAISS index for top {DOCS_FETCH_LIMIT} matches...")
     D, I = vectorstore.index.search(np.array([query_emb], dtype=np.float32), DOCS_FETCH_LIMIT)
+    print(f"[DEBUG][retrieve] FAISS search complete. Top 3 distances: {D[0][:3]}")
     candidate_indices = I[0].tolist()
-    candidate_doc_ids = [
-        vectorstore.index_to_docstore_id[idx]
-        for idx in candidate_indices if idx in vectorstore.index_to_docstore_id
-    ]
+    print(f"[DEBUG][retrieve] Found {len(candidate_indices)} candidate indices")
+
+    # First verify which documents exist in SQLite
+    print("\n[DEBUG][retrieve] Verifying document existence in SQLite...")
+    conn = sqlite3.connect(VECTORSTORE_PATH + "/docs.sqlite")
+    existing_ids = set()
+    for row in conn.execute("SELECT id FROM docs").fetchall():
+        existing_ids.add(row[0])
+    print(f"[DEBUG][retrieve] Found {len(existing_ids)} documents in SQLite")
+
+    # Load id mapping explicitly to ensure we have the latest version
+    with open(VECTORSTORE_PATH + "/id_map.json") as f:
+        id_map = json.load(f)
+    print(f"[DEBUG][retrieve] Loaded id_map with {len(id_map)} entries")
+
+    # Map FAISS indices to document IDs
+    candidate_doc_ids = []
+    valid_id_map = {k: v for k, v in id_map.items() if v in existing_ids}
+    print(f"[DEBUG][retrieve] {len(valid_id_map)} of {len(id_map)} mappings point to existing documents")
+    
+    for idx in candidate_indices:
+        key = str(idx)  # id_map uses string keys
+        if key in id_map:
+            doc_id = id_map[key]
+            candidate_doc_ids.append(doc_id)
+            # print(f"[DEBUG][retrieve] Mapped index {idx} to doc_id {doc_id}")
+        else:
+            print(f"[WARN] No mapping found for FAISS index {idx}")
+    print(f"[DEBUG][retrieve] Mapped to {len(candidate_doc_ids)} valid doc IDs")
+    if len(candidate_doc_ids) != len(candidate_indices):
+        print(f"[DEBUG][retrieve] WARNING: {len(candidate_indices) - len(candidate_doc_ids)} indices had no matching doc IDs")
+        print(f"[DEBUG][retrieve] First few missing indices: {[idx for idx in candidate_indices[:10] if idx not in vectorstore.index_to_docstore_id]}")
 
     if not candidate_doc_ids:
+        print("[DEBUG][retrieve] No valid document IDs found!")
         return {"doc_ids": [], "metadata_map": {}, "query": query}
 
     # ---- Memory-efficient MMR ----
+    print("\n[DEBUG][retrieve] Starting MMR reranking...")
     lambda_mult = 0.7
     k = min(DOCS_KEEP_LIMIT, len(candidate_doc_ids))
+    print(f"[DEBUG][retrieve] Will select top {k} documents from {len(candidate_doc_ids)} candidates")
 
+    selected_indices = []
     selected_doc_ids = []
     selected_embs = []
 
     # Seed with best match
     best_idx = candidate_indices[0]
-    selected_doc_ids.append(vectorstore.index_to_docstore_id[best_idx])
+    best_doc_id = id_map[str(best_idx)]
+    selected_indices.append(best_idx)
+    selected_doc_ids.append(best_doc_id)
     selected_embs.append(vectorstore.index.reconstruct(best_idx))
+    print(f"[DEBUG][retrieve] Seed document: index={best_idx}, doc_id={best_doc_id}")
 
     # Remove it from candidates
-    remaining = [(idx, doc_id) for idx, doc_id in zip(candidate_indices, candidate_doc_ids)
-                 if doc_id not in selected_doc_ids]
+    remaining = [(idx, id_map[str(idx)]) for idx in candidate_indices[1:]
+                if str(idx) in id_map]
 
     while len(selected_doc_ids) < k and remaining:
         scores = []
@@ -228,17 +325,30 @@ async def retrieve_node(state):
             )
             mmr_score = lambda_mult * sim_to_query - (1 - lambda_mult) * sim_to_selected
             scores.append((mmr_score, idx, doc_id, emb))
+        
+        if not scores:
+            print("[DEBUG][retrieve] No more valid candidates for MMR")
+            break
+            
         _, idx, doc_id, emb = max(scores, key=lambda x: x[0])
+        selected_indices.append(idx)
         selected_doc_ids.append(doc_id)
         selected_embs.append(emb)
+        # print(f"[DEBUG][retrieve] Selected: index={idx}, doc_id={doc_id}, mmr_score={_:.4f}")
         remaining = [(i, d) for (i, d) in remaining if d != doc_id]
 
-    # Load only metadata
+    print(f"[DEBUG][retrieve] Final selection: {len(selected_doc_ids)} documents")
+
+    # Load metadata from SQLite
+    print("[DEBUG][retrieve] Loading metadata from SQLite...")
     metadata_map = {}
     for doc_id in selected_doc_ids:
         docs = vectorstore.docstore.get_by_ids([doc_id])
         if docs:
             metadata_map[doc_id] = docs[0].metadata
+            # print(f"[DEBUG][retrieve] Loaded metadata for doc_id {doc_id}")
+        else:
+            print(f"[WARN] Could not find document {doc_id} in SQLite")
 
     log_memory("after retrieval")
     return {"doc_ids": selected_doc_ids, "metadata_map": metadata_map, "query": query}

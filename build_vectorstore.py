@@ -1,13 +1,15 @@
 import os
 import json
 import sqlite3
+import faiss
+import numpy
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 DATA_DIR = "data"
-INDEX_DIR = "app/faiss_index"
+INDEX_DIR = "app/vectorstore"
 SQLITE_PATH = os.path.join(INDEX_DIR, "docs.sqlite")
 
 # --------------------------
@@ -39,13 +41,34 @@ def init_sqlite(db_path):
     return conn
 
 def insert_documents(conn, documents):
+    doc_ids = []  # Track assigned IDs
+    
     for doc in documents:
-        doc_id = doc.metadata.get("id") or os.urandom(8).hex()
+        # Get the chunk ID that was assigned during document creation
+        doc_id = doc.metadata.get("id")
+        if not doc_id:
+            print(f"[ERROR] Document missing ID in metadata: {doc.metadata}")
+            continue
+            
+        doc_ids.append(doc_id)
+        
+        print(f"[DEBUG] Inserting document {doc_id}")
         conn.execute(
             "INSERT OR REPLACE INTO docs (id, content, metadata) VALUES (?, ?, ?)",
             (doc_id, doc.page_content, json.dumps(doc.metadata))
         )
-    conn.commit()
+        
+        if len(doc_ids) % 100 == 0:
+            print(f"[DEBUG] Inserted {len(doc_ids)} documents...")
+            conn.commit()  # Periodic commits
+            
+    conn.commit()  # Final commit
+    
+    # Count unique parent posts
+    unique_parents = len(set(doc.metadata.get("parent_id") for doc in documents))
+    print(f"[DEBUG] Total documents inserted: {len(doc_ids)}")
+    print(f"[DEBUG] Total unique parent posts: {unique_parents}")
+    return doc_ids
 
 def get_existing_ids(conn):
     rows = conn.execute("SELECT id FROM docs").fetchall()
@@ -83,8 +106,17 @@ def load_json_files(data_dir, existing_ids=None):
 
                 # Split into chunks
                 chunks = text_splitter.split_text(content)
-                for chunk in chunks:
-                    documents.append(Document(page_content=chunk, metadata=metadata))
+                for i, chunk in enumerate(chunks):
+                    # Create a unique ID for each chunk that will be consistent
+                    # between FAISS and SQLite
+                    chunk_id = f"{post_id}_chunk_{i}"
+                    chunk_metadata = metadata.copy()
+                    chunk_metadata["id"] = chunk_id  # Use the same ID format everywhere
+                    chunk_metadata["parent_id"] = post_id  # Original Reddit post ID
+                    chunk_metadata["chunk_index"] = i  # Which chunk of the post
+                    chunk_metadata["total_chunks"] = len(chunks)  # Total chunks in post
+                    documents.append(Document(page_content=chunk, metadata=chunk_metadata))
+                print(f"[DEBUG] Created {len(chunks)} chunks for post {post_id}")
     return documents
 
 # --------------------------
@@ -104,20 +136,75 @@ def main():
         print("No new documents to add. Exiting.")
         return
 
-    # Insert documents into SQLite
-    insert_documents(conn, new_docs)
+    # Insert documents into SQLite and get assigned IDs
+    doc_ids = insert_documents(conn, new_docs)
+    print(f"[DEBUG] Inserted {len(doc_ids)} documents into SQLite")
+    print(f"[DEBUG] Sample doc IDs: {doc_ids[:5]}")
 
     # Build or update FAISS index
     if os.path.exists(os.path.join(INDEX_DIR, "index.faiss")):
-        faiss_index = FAISS.load_local(INDEX_DIR, embedding_model, allow_dangerous_deserialization=True)
-        faiss_index.add_documents(new_docs)
-        print("Updated existing FAISS index")
+        print("Loading existing index...")
+        # Load existing index
+        old_index = faiss.read_index(os.path.join(INDEX_DIR, "index.faiss"))
+        
+        # Load existing id mapping
+        with open(os.path.join(INDEX_DIR, "id_map.json"), "r") as f:
+            old_id_map = json.load(f)
+            
+        # Create new index with correct size
+        old_size = old_index.ntotal
+        print(f"Existing index size: {old_size}")
+        
+        # Get embeddings for new docs
+        print("Embedding new documents...")
+        embeddings = embedding_model.embed_documents([d.page_content for d in new_docs])
+        
+        # Update index
+        old_index.add(numpy.array(embeddings, dtype="float32"))
+        print(f"Updated index size: {old_index.ntotal}")
+        
+        # Update id mapping - use document IDs directly
+        id_map = old_id_map.copy()
+        for i, doc in enumerate(new_docs):
+            doc_id = doc.metadata["id"]  # Using consistent chunk_id format
+            id_map[str(old_size + i)] = doc_id
+            print(f"[DEBUG] Mapped FAISS index {old_size + i} -> doc_id {doc_id}")
+            
+        faiss_index = FAISS(
+            embedding_function=embedding_model,
+            index=old_index,
+            docstore=None,  # We're using our own SQLite docstore
+            index_to_docstore_id=id_map
+        )
+        print(f"Index updated with {len(new_docs)} new documents")
     else:
+        print("Creating new index...")
         faiss_index = FAISS.from_documents(new_docs, embedding_model)
+        # Ensure index_to_docstore_id uses our chunk IDs
+        corrected_map = {}
+        for idx, _ in enumerate(new_docs):
+            doc_id = new_docs[idx].metadata["id"]  # Using consistent chunk_id format
+            corrected_map[str(idx)] = doc_id
+            print(f"[DEBUG] Mapped FAISS index {idx} -> doc_id {doc_id}")
+        faiss_index.index_to_docstore_id = corrected_map
         print("Created new FAISS index")
 
-    faiss_index.save_local(INDEX_DIR)
-    print(f"FAISS index saved to {INDEX_DIR}")
+    # --------------------------
+    # Save FAISS index without index.pkl
+    # --------------------------
+    print("[DEBUG] Saving FAISS index...")
+    faiss.write_index(faiss_index.index, os.path.join(INDEX_DIR, "index.faiss"))
+    print(f"[DEBUG] FAISS index saved with {faiss_index.index.ntotal} vectors")
+
+    # Save id_map.json with consistent IDs
+    print("[DEBUG] Saving id_map.json...")
+    with open(os.path.join(INDEX_DIR, "id_map.json"), "w") as f:
+        json.dump(faiss_index.index_to_docstore_id, f)
+    print("[DEBUG] Sample id_map entries:")
+    for idx, doc_id in list(faiss_index.index_to_docstore_id.items())[:5]:
+        print(f"  {idx} -> {doc_id}")
+
+    print(f"FAISS index + id_map.json saved to {INDEX_DIR}")
 
 if __name__ == "__main__":
     main()
