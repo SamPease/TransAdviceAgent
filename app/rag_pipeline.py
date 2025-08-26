@@ -409,7 +409,7 @@ async def summarize_node(state):
     final_answer = await llm.ainvoke(final_prompt_text)
 
     return {
-        "final_answer": final_answer,
+        "final_answer": final_answer.content,  # Extract the content from AIMessage
         "query": state["query"],
         "used_doc_ids": doc_ids,
         "metadata_map": state.get("metadata_map")
