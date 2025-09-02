@@ -15,6 +15,11 @@ from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain.prompts import PromptTemplate
 from langgraph.graph import StateGraph, END
 from langsmith import Client
+from huggingface_hub import hf_hub_download
+import shutil
+import time
+import random
+from collections import deque
 
 # For debugging/profiling (commented out)
 # import psutil
@@ -54,7 +59,53 @@ DOC_BATCH_SIZE = 10          # how many docs to fetch from FAISS per summarizati
 SUMMARY_BATCH_SIZE = 10      # how many summaries to reduce at once
 DOCS_FETCH_LIMIT = 200       # how many docs to pull from FAISS in initial search
 DOCS_KEEP_LIMIT = 100        # how many docs to keep after reranking
-VECTORSTORE_PATH = "./app/vectorstore"  # path to FAISS index directory
+# Allow the deploy environment to override where the vectorstore is stored.
+# Prefer a repo-relative path so build-time downloads are included in the image.
+VECTORSTORE_PATH = os.environ.get("VECTORSTORE_PATH", "./app/vectorstore")  # path to FAISS index directory
+
+
+def ensure_vectorstore_files(repo_id: str = "SamPease/TransAdviceAgent", files: list | None = None, repo_type: str = "dataset") -> None:
+    """Ensure vectorstore files exist on disk by downloading from HuggingFace if missing.
+
+    This is safe to call at build or startup. For private datasets set HF_TOKEN env var.
+    """
+    files = files or ["index.faiss", "docs.sqlite", "id_map.json"]
+    global VECTORSTORE_PATH
+    # Try to create the target directory; if the environment is read-only (e.g. trying
+    # to write to a protected root path), fall back to /tmp so the process can continue.
+    try:
+        os.makedirs(VECTORSTORE_PATH, exist_ok=True)
+    except Exception as exc:
+        logger.warning("Could not create VECTORSTORE_PATH '%s': %s — falling back to /tmp", VECTORSTORE_PATH, exc)
+        fallback = os.environ.get("FALLBACK_VECTORSTORE_PATH", "/tmp/app_vectorstore")
+        try:
+            os.makedirs(fallback, exist_ok=True)
+            VECTORSTORE_PATH = fallback
+        except Exception:
+            # Last resort: continue and let later operations raise readable errors
+            logger.exception("Failed to create fallback vectorstore path %s", fallback)
+    # Accept multiple common env var names for HF token so Render/.env values work
+    token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+    )
+    for fn in files:
+        dest = os.path.join(VECTORSTORE_PATH, fn)
+        # skip if file already present and non-empty
+        try:
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                continue
+        except Exception:
+            pass
+
+        # download to HF cache and copy into place
+        try:
+            local = hf_hub_download(repo_id=repo_id, filename=fn, repo_type=repo_type, token=token)
+            if os.path.abspath(local) != os.path.abspath(dest):
+                shutil.copy(local, dest)
+        except Exception as exc:
+            logger.warning("Could not download %s from %s: %s", fn, repo_id, exc)
 
 # --------------------------
 # Prompts
@@ -72,6 +123,137 @@ from langchain.callbacks.base import BaseCallbackHandler
 class StreamingPrintHandler(BaseCallbackHandler):
     def on_llm_new_token(self, token: str, **kwargs) -> None:
         print(token, end="", flush=True)
+
+
+# --------------------------
+# Global rate limit / concurrency controls for LLM calls
+# --------------------------
+# Tunable parameters — adjust to match provider limits (safe defaults below)
+GLOBAL_CONCURRENCY = 10       # max concurrent LLM calls across the app
+GLOBAL_RPS = 45              # targets (calls per minute); we'll convert to per-second window
+RPS_PERIOD = 60.0            # seconds for the GLOBAL_RPS window
+MAX_RETRIES = 4
+BASE_BACKOFF = 0.5           # seconds
+MAX_BACKOFF = 30.0           # seconds
+
+# Runtime primitives
+_semaphore = asyncio.Semaphore(GLOBAL_CONCURRENCY)
+
+class SimpleRateLimiter:
+    """Sliding-window rate limiter suitable for low-volume use.
+
+    Keeps timestamps of recent calls and blocks until a slot is available.
+    """
+    def __init__(self, max_calls: int, period: float):
+        self.max_calls = max_calls
+        self.period = period
+        self.timestamps = deque()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            now = time.monotonic()
+            # pop expired timestamps
+            while self.timestamps and now - self.timestamps[0] >= self.period:
+                self.timestamps.popleft()
+            if len(self.timestamps) < self.max_calls:
+                self.timestamps.append(now)
+                return
+            wait = self.period - (now - self.timestamps[0])
+        await asyncio.sleep(wait)
+        await self.acquire()
+
+# Create a process-global limiter (uses GLOBAL_RPS over RPS_PERIOD seconds)
+_rate_limiter = SimpleRateLimiter(max_calls=GLOBAL_RPS, period=RPS_PERIOD)
+
+
+def _extract_retry_after_from(obj) -> float | None:
+    # obj can be a response-like object or an exception with .response
+    headers = {}
+    try:
+        if hasattr(obj, "headers") and obj.headers:
+            headers = {k.lower(): v for k, v in obj.headers.items()}
+        elif hasattr(obj, "response") and getattr(obj.response, "headers", None):
+            headers = {k.lower(): v for k, v in obj.response.headers.items()}
+    except Exception:
+        return None
+
+    if not headers:
+        return None
+    ra = headers.get("retry-after") or headers.get("Retry-After")
+    if ra is None:
+        return None
+    try:
+        return float(ra)
+    except Exception:
+        # sometimes it's an HTTP-date; ignore in that case
+        return None
+
+
+def _is_rate_limit_exception(exc: Exception) -> bool:
+    # Best-effort detection for provider rate-limit errors
+    msg = str(exc).lower()
+    if hasattr(exc, "status_code") and getattr(exc, "status_code") == 429:
+        return True
+    if hasattr(exc, "response") and getattr(exc.response, "status", None) == 429:
+        return True
+    if "rate limit" in msg or "rate_limited" in msg or "429" in msg:
+        return True
+    return False
+
+
+async def call_with_limits(call_coro_fn, *, max_retries: int = MAX_RETRIES):
+    """Call an async LLM coroutine factory with global concurrency, rate
+    limiting and retry/backoff on rate limits or transient errors.
+
+    call_coro_fn must be a zero-argument callable returning an awaitable.
+    """
+    attempt = 0
+    while True:
+        # Wait for rate token and a free concurrency slot
+        await _rate_limiter.acquire()
+        async with _semaphore:
+            try:
+                resp = await call_coro_fn()
+            except Exception as exc:
+                # If it's clearly a rate-limit error, honor Retry-After when available
+                if _is_rate_limit_exception(exc):
+                    ra = _extract_retry_after_from(exc)
+                    if ra:
+                        await asyncio.sleep(ra)
+                        attempt += 1
+                        if attempt > max_retries:
+                            raise
+                        continue
+                    # otherwise fall through to exponential backoff
+                # For other transient errors, retry with backoff
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                backoff = min(MAX_BACKOFF, BASE_BACKOFF * (2 ** (attempt - 1))) * random.uniform(0.8, 1.2)
+                await asyncio.sleep(backoff)
+                continue
+
+        # If the response itself encodes a rate limit (some clients return 429)
+        status = getattr(resp, "status", None) or getattr(resp, "status_code", None)
+        headers = getattr(resp, "headers", {}) or {}
+        if status == 429 or (isinstance(status, int) and status >= 500 and "rate" in str(status).lower()):
+            ra = _extract_retry_after_from(resp) or None
+            if ra:
+                await asyncio.sleep(ra)
+                attempt += 1
+                if attempt > max_retries:
+                    raise RuntimeError("rate-limited, max retries exceeded")
+                continue
+            attempt += 1
+            if attempt > max_retries:
+                raise RuntimeError("rate-limited, max retries exceeded")
+            backoff = min(MAX_BACKOFF, BASE_BACKOFF * (2 ** (attempt - 1))) * random.uniform(0.8, 1.2)
+            await asyncio.sleep(backoff)
+            continue
+
+        return resp
+
 
 
 # --------------------------
@@ -157,13 +339,13 @@ def get_vectorstore():
 
 async def summarize_batch(batch: List[Document], question: str) -> str:
     batch_text = "\n\n".join(doc.page_content for doc in batch)
-    result = await map_prompt.ainvoke({"question": question, "context": batch_text})
-    return result.content
+    resp = await call_with_limits(lambda: map_prompt.ainvoke({"question": question, "context": batch_text}))
+    return getattr(resp, "content", resp)
 
 async def reduce_batch(batch: List[str], question: str) -> str:
     batch_text = "\n\n".join(batch)
-    result = await reduce_prompt.ainvoke({"question": question, "summaries": batch_text})
-    return result.content
+    resp = await call_with_limits(lambda: reduce_prompt.ainvoke({"question": question, "summaries": batch_text}))
+    return getattr(resp, "content", resp)
 
 
 def _extract_url_from_metadata(metadata: dict) -> str | None:
@@ -244,7 +426,7 @@ class ChatAgentState(TypedDict, total=False):
 # --------------------------
 async def retrieve_node(state):
     query = state["query"]
-    result = await enhance_prompt.ainvoke({"question": query})
+    result = await call_with_limits(lambda: enhance_prompt.ainvoke({"question": query}))
     enhanced_query = result.content
     vectorstore = get_vectorstore()
 
@@ -453,10 +635,15 @@ async def summarize_node(state):
     summarization_tasks = []
     for batch_index, batch_docs in enumerate(loaded_batches, 1):
         logger.info("Queuing batch %d (%d documents)", batch_index, len(batch_docs))
-        summarization_tasks.append(summarize_batch(batch_docs, state["query"]))
+        # wrap map prompt calls with global rate/concurrency limits
+        summarization_tasks.append(call_with_limits(lambda: map_prompt.ainvoke({"question": state["query"], "context": "\n\n".join(doc.page_content for doc in batch_docs)})))
     
     # Wait for all summaries
     level_summaries = await asyncio.gather(*summarization_tasks)
+    # Ensure each summary is a plain string. Some clients return message objects
+    # (e.g., with a .content attribute); normalize those here so reductions can
+    # safely join summaries.
+    level_summaries = [getattr(s, "content", s) for s in level_summaries]
     logger.info("Completed parallel summarization of %d batches", len(level_summaries))
 
     # --------------------------
@@ -471,7 +658,8 @@ async def summarize_node(state):
         reduction_tasks = []
         for i in range(0, len(level_summaries), SUMMARY_BATCH_SIZE):
             batch = level_summaries[i:i + SUMMARY_BATCH_SIZE]
-            reduction_tasks.append(reduce_batch(batch, state["query"]))
+            # wrap reduce calls with rate/concurrency guard
+            reduction_tasks.append(call_with_limits(lambda b=batch: reduce_prompt.ainvoke({"question": state["query"], "summaries": "\n\n".join(b)})))
 
         # Wait for all reductions to complete
         results = await asyncio.gather(*reduction_tasks)
@@ -486,13 +674,14 @@ async def summarize_node(state):
     # --------------------------
     logger.info("Generating final answer from consolidated summary")
 
-    final_answer = await final_prompt.ainvoke({"question": state["query"], "final_summary": level_summaries[0]})
+    final_resp = await call_with_limits(lambda: final_prompt.ainvoke({"question": state["query"], "final_summary": level_summaries[0]}))
+    final_answer = getattr(final_resp, "content", final_resp)
     logger.info("Answer generation complete")
 
     # Propagate metadata_map and the final answer. Summarize node doesn't modify metadata.
     metadata_map = state.get("metadata_map") or {}
     return {
-        "final_answer": final_answer.content,
+        "final_answer": final_answer,
         "metadata_map": metadata_map,
     }
 

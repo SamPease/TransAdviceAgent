@@ -2,9 +2,20 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .rag_pipeline import run_rag  # your existing function
+from .rag_pipeline import run_rag, ensure_vectorstore_files  # your existing function
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+def startup_download_vectorstore():
+    # Try to download vectorstore files at startup to reduce repeated wake-up downloads.
+    try:
+        ensure_vectorstore_files()
+    except Exception:
+        # Don't block startup permanently for transient HF issues; log and continue.
+        import logging
+        logging.getLogger(__name__).exception("Failed to ensure vectorstore files at startup")
 
 # --- Secure CORS setup ---
 origins = [
