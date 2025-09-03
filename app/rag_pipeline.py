@@ -12,6 +12,7 @@ from langchain.schema import Document
 from langchain_anthropic import ChatAnthropic
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.prompts import PromptTemplate
 from langgraph.graph import StateGraph, END
 from langsmith import Client
@@ -20,6 +21,8 @@ import shutil
 import time
 import random
 from collections import deque
+import threading
+
 
 # For debugging/profiling (commented out)
 # import psutil
@@ -42,12 +45,41 @@ _embedding_model = None
 
 def get_embedding_model():
     global _embedding_model
-    if _embedding_model is None:
+    if _embedding_model is not None:
+        return _embedding_model
+    elif os.environ.get("LOCAL_EMBEDDING_MODEL", "").lower() in ("1", "true", "yes"):
+        _embedding_model = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2"
+            )
+    else:
         _embedding_model = HuggingFaceEndpointEmbeddings(
                 model="sentence-transformers/all-MiniLM-L6-v2",
                 )
 
     return _embedding_model
+
+
+async def embed_query_with_retry(text: str):
+    """Run the HF endpoint embedding in a thread and apply global rate/ retry limits.
+
+    This ensures embedding requests share the same rate limiting and retry
+    instrumentation as LLM calls. Returns the embedding vector (list/np.array).
+    """
+    # Wrap the blocking embed call in asyncio.to_thread so call_with_limits can
+    # await it like other async providers. We also add debug logging so delays
+    # caused by rate-limiting are visible.
+    def sync_embed():
+        model = get_embedding_model()
+        return model.embed_query(text)
+
+    # call_with_limits expects a zero-arg coroutine factory; provide a lambda
+    # that returns the awaitable for the threaded call.
+    try:
+        resp = await call_with_limits(lambda: asyncio.to_thread(sync_embed))
+    except Exception as exc:
+        logger.exception("Embedding failed after retries: %s", exc)
+        raise
+    return resp
 
 
 
@@ -160,6 +192,12 @@ class SimpleRateLimiter:
                 self.timestamps.append(now)
                 return
             wait = self.period - (now - self.timestamps[0])
+        # Log when we're being delayed by the global rate limiter so it's
+        # obvious in logs that embedding/LLM calls are being throttled.
+        try:
+            logger.info("Rate limiter: waiting %.2fs for slot (max_calls=%d, period=%.1fs)", wait, self.max_calls, self.period)
+        except Exception:
+            pass
         await asyncio.sleep(wait)
         await self.acquire()
 
@@ -220,6 +258,10 @@ async def call_with_limits(call_coro_fn, *, max_retries: int = MAX_RETRIES):
                 if _is_rate_limit_exception(exc):
                     ra = _extract_retry_after_from(exc)
                     if ra:
+                        try:
+                            logger.info("Rate-limited: sleeping %.2fs (Retry-After) before retrying (attempt=%d)", ra, attempt + 1)
+                        except Exception:
+                            pass
                         await asyncio.sleep(ra)
                         attempt += 1
                         if attempt > max_retries:
@@ -231,6 +273,10 @@ async def call_with_limits(call_coro_fn, *, max_retries: int = MAX_RETRIES):
                 if attempt > max_retries:
                     raise
                 backoff = min(MAX_BACKOFF, BASE_BACKOFF * (2 ** (attempt - 1))) * random.uniform(0.8, 1.2)
+                try:
+                    logger.info("Transient error: sleeping %.2fs before retrying (attempt=%d): %s", backoff, attempt, str(exc))
+                except Exception:
+                    pass
                 await asyncio.sleep(backoff)
                 continue
 
@@ -240,6 +286,10 @@ async def call_with_limits(call_coro_fn, *, max_retries: int = MAX_RETRIES):
         if status == 429 or (isinstance(status, int) and status >= 500 and "rate" in str(status).lower()):
             ra = _extract_retry_after_from(resp) or None
             if ra:
+                try:
+                    logger.info("Response indicates rate limit: sleeping %.2fs (Retry-After) before retrying (attempt=%d)", ra, attempt + 1)
+                except Exception:
+                    pass
                 await asyncio.sleep(ra)
                 attempt += 1
                 if attempt > max_retries:
@@ -249,6 +299,10 @@ async def call_with_limits(call_coro_fn, *, max_retries: int = MAX_RETRIES):
             if attempt > max_retries:
                 raise RuntimeError("rate-limited, max retries exceeded")
             backoff = min(MAX_BACKOFF, BASE_BACKOFF * (2 ** (attempt - 1))) * random.uniform(0.8, 1.2)
+            try:
+                logger.info("Response indicates transient server/rate issue: sleeping %.2fs before retrying (attempt=%d)", backoff, attempt)
+            except Exception:
+                pass
             await asyncio.sleep(backoff)
             continue
 
@@ -259,12 +313,6 @@ async def call_with_limits(call_coro_fn, *, max_retries: int = MAX_RETRIES):
 # --------------------------
 # SQLite docstore
 # --------------------------
-import sqlite3
-import json
-import threading
-from typing import List
-from langchain.schema import Document
-
 class SQLiteDocstore:
     """Minimal thread-safe docstore for lazy-loading documents from SQLite."""
     def __init__(self, db_path="docs.sqlite"):
@@ -418,6 +466,7 @@ class ChatAgentState(TypedDict, total=False):
     query: str
     doc_ids: List[str]
     metadata_map: dict
+    summary: Document
     final_answer: str
     sources: List[dict]
 
@@ -440,8 +489,14 @@ async def retrieve_node(state):
     with open(VECTORSTORE_PATH + "/id_map.json") as f:
         id_map = json.load(f)
 
-    # Generate query embedding and search
-    query_emb = get_embedding_model().embed_query(enhanced_query)
+    # Generate query embedding and search. Use embed_query_with_retry so
+    # embeddings go through the same rate limiting / retry logic and produce
+    # informative logs when delayed.
+    logger.info("Requesting embedding for enhanced query")
+    start_emb = time.monotonic()
+    query_emb = await embed_query_with_retry(enhanced_query)
+    elapsed_emb = time.monotonic() - start_emb
+    logger.info("Embedding completed in %.3fs", elapsed_emb)
     D, I = vectorstore.index.search(np.array([query_emb], dtype=np.float32), DOCS_FETCH_LIMIT)
     candidate_indices = I[0].tolist()
     logger.info("Initial search found %d relevant documents", len(candidate_indices))
@@ -634,16 +689,35 @@ async def summarize_node(state):
     logger.info("Starting parallel summarization of %d batches", len(loaded_batches))
     summarization_tasks = []
     for batch_index, batch_docs in enumerate(loaded_batches, 1):
-        logger.info("Queuing batch %d (%d documents)", batch_index, len(batch_docs))
+        # Log batch size and a small sample of document IDs (if available)
+        sample_ids = []
+        try:
+            for d in batch_docs[:3]:
+                mid = None
+                try:
+                    mid = (getattr(d, "metadata", {}) or {}).get("id")
+                except Exception:
+                    mid = None
+                sample_ids.append(mid or (d.page_content[:60] if getattr(d, "page_content", None) else "<no-id>"))
+        except Exception:
+            sample_ids = ["<err>"]
+        logger.info("Queuing batch %d (%d documents) sample_ids=%s", batch_index, len(batch_docs), sample_ids)
         # wrap map prompt calls with global rate/concurrency limits
-        summarization_tasks.append(call_with_limits(lambda: map_prompt.ainvoke({"question": state["query"], "context": "\n\n".join(doc.page_content for doc in batch_docs)})))
+        # Bind batch_docs into the lambda's default argument to avoid the
+        # common late-binding closure issue where all lambdas would capture
+        # the same final value of `batch_docs`.
+        summarization_tasks.append(
+            call_with_limits(lambda bd=batch_docs: map_prompt.ainvoke({
+                "question": state["query"],
+                "context": "\n\n".join(doc.page_content for doc in bd)
+            }))
+        )
     
     # Wait for all summaries
     level_summaries = await asyncio.gather(*summarization_tasks)
     # Ensure each summary is a plain string. Some clients return message objects
     # (e.g., with a .content attribute); normalize those here so reductions can
     # safely join summaries.
-    level_summaries = [getattr(s, "content", s) for s in level_summaries]
     logger.info("Completed parallel summarization of %d batches", len(level_summaries))
 
     # --------------------------
@@ -651,6 +725,8 @@ async def summarize_node(state):
     # --------------------------
     reduction_round = 1
     while len(level_summaries) > 1:
+        level_summaries = [getattr(s, "content", s) for s in level_summaries]
+
         logger.info("Starting reduction round %d", reduction_round)
         logger.info("Combining %d summaries in batches of %d", len(level_summaries), SUMMARY_BATCH_SIZE)
 
@@ -669,23 +745,27 @@ async def summarize_node(state):
         level_summaries = next_level
         reduction_round += 1
 
-    # --------------------------
-    # Final answer generation
-    # --------------------------
-    logger.info("Generating final answer from consolidated summary")
 
-    final_resp = await call_with_limits(lambda: final_prompt.ainvoke({"question": state["query"], "final_summary": level_summaries[0]}))
-    final_answer = getattr(final_resp, "content", final_resp)
-    logger.info("Answer generation complete")
 
     # Propagate metadata_map and the final answer. Summarize node doesn't modify metadata.
     metadata_map = state.get("metadata_map") or {}
     return {
-        "final_answer": final_answer,
+        "summary": level_summaries[0],
         "metadata_map": metadata_map,
     }
 
 async def output_node(state):
+     # --------------------------
+    # Final answer generation
+    # --------------------------
+    logger.info("Generating final answer from consolidated summary")
+    final_summary = state.get("summary").content
+
+    final_resp = await call_with_limits(lambda: final_prompt.ainvoke({"question": state["query"], "final_summary": final_summary}))
+    final_answer = getattr(final_resp, "content", final_resp)
+    logger.info("Answer generation complete")
+
+
     metadata_map = state.get("metadata_map") or {}
 
     # Build a list of (doc_id, relevance, url) directly from metadata_map so
@@ -726,7 +806,7 @@ async def output_node(state):
         logger.debug("Unable to log output sources", exc_info=True)
 
     return {
-        "final_answer": state["final_answer"],
+        "final_answer": final_answer,
         "sources": sources,
     }
 
