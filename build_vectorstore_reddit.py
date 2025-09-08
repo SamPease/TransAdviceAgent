@@ -8,7 +8,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-DATA_DIR = "data"
+DATA_DIR = "data/reddit"
 INDEX_DIR = "app/vectorstore"
 SQLITE_PATH = os.path.join(INDEX_DIR, "docs.sqlite")
 
