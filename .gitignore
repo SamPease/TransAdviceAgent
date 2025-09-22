@@ -2,8 +2,3 @@
 /.env
 /.venv
 /data
-
-# Large vectorstore files (managed with Git LFS or stored externally)
-app/vectorstore/docs.sqlite
-app/vectorstore/index.faiss
-app/vectorstore/id_map.json

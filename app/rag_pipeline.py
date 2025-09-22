@@ -791,13 +791,31 @@ async def output_node(state):
     # because url_entries was sorted by relevance). This avoids overwriting
     # a high relevance with a later lower-relevance duplicate.
     url_to_rel = {}
+    # Also map url -> first-seen doc_id so we can lookup other metadata fields
+    # such as a title (if present) for inclusion in the final sources list.
+    url_to_docid = {}
     for _, r, u in url_entries:
         if u and u not in url_to_rel:
             url_to_rel[u] = r
+            url_to_docid[u] = _
 
     sources = []
     for u in ordered_urls:
-        sources.append({"url": u, "relevance": url_to_rel.get(u, 0.0)})
+        entry = {"url": u, "relevance": url_to_rel.get(u, 0.0)}
+        # Only include a 'title' key if the corresponding metadata contains one.
+        try:
+            doc_id = url_to_docid.get(u)
+            if doc_id:
+                meta = metadata_map.get(doc_id) or {}
+                # Accept common title keys: 'title' or 'heading'
+                title = meta.get("title") or meta.get("heading")
+                if title:
+                    entry["title"] = title
+        except Exception:
+            # Don't fail the whole pipeline if title extraction fails; skip title.
+            logger.debug("Failed to extract title for url %s", u, exc_info=True)
+
+        sources.append(entry)
 
     # Debug log the final source ordering for easy inspection during runs.
     try:
