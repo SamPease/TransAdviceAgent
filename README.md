@@ -102,6 +102,14 @@ For a detailed technical writeup, architecture overview, and implementation deta
 - All content is sourced from community discussions and should be verified with healthcare providers
 - The AI responses are generated based on available data and may not reflect the most current medical guidelines
 
+## Large data artifacts
+
+The repository stores large vectorstore artifacts (FAISS index, SQLite docs, and an ID map). These files are managed with Git LFS and may not be included in a shallow clone. If you need to obtain or rebuild them:
+
+- The files are: `app/vectorstore/index.faiss`, `app/vectorstore/docs.sqlite`, and `app/vectorstore/id_map.json`.
+- They are tracked via Git LFS; to fetch them after cloning run `git lfs pull` in the cloned repo or `git clone --recurse-submodules` if using the submodule setup.
+- Alternatively, rebuild the vectorstore locally using the scripts in `scripts/` if you prefer not to store binary artifacts in the repo.
+
 ## Contributing
 
 Contributions are welcome! Please ensure any additions maintain the focus on providing helpful, accurate, and respectful information for the transgender community.
