@@ -76,9 +76,19 @@ The system uses a sophisticated RAG pipeline that:
 
 The system can ingest data from multiple sources:
 
-- **Reddit**: Use `get_reddit.py` to collect posts from r/Transgender_Surgeries
+- **Reddit**: Use `scripts/get_reddit.py` to collect posts from r/Transgender_Surgeries
 - **WhatsApp**: Use `copy_whatsapp_chats.py` to process chat exports
 - **Text Files**: Add any `.txt` files to the `data/` directory
+
+### Fetching Wikipedia articles
+
+You can fetch Wikipedia pages by category and save each page as JSON for later processing. Example:
+
+```bash
+python scripts/fetch_wikipedia_by_category.py --categories "Transgender rights,Transgender" --max-pages 200 --depth 1 --include-subcats
+```
+
+This will save files under `data/wikipedia/<category_slug>/`.
 
 ## Live Demo
 
