@@ -357,6 +357,7 @@ class SQLiteDocstore:
 def get_vectorstore():
     # Use memory-mapped IO for FAISS index
     index = faiss.read_index(VECTORSTORE_PATH + "/index.faiss", faiss.IO_FLAG_MMAP)
+    index.nprobe = 10  # number of clusters to search; tune for speed/accuracy
 
     with open(VECTORSTORE_PATH + "/id_map.json") as f:
         id_map = json.load(f)
