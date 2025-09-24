@@ -830,32 +830,43 @@ async def output_node(state):
 
 
     metadata_map = state.get("metadata_map") or {}
+    # Build a relevance-sorted list of sources (ordered by relevance desc).
+    # Each source is a dict with exactly the fields: 'title' and 'url'.
+    # If a document has no URL, we return both title and url as the string 'private'.
+    sources: List[dict] = []
 
-    # Build a relevance-sorted list of sources, one per document. This ensures
-    # all retrieved documents are represented in the final `sources` output,
-    # even if some documents have no URL. Each source includes doc_id, url
-    # (may be empty), relevance, and an optional title.
-    sources = []
-    # Build list of (doc_id, relevance) and sort by relevance desc. If a
-    # relevance value is missing, treat as 0.0.
+    # Build list of (doc_id, relevance) and sort by relevance desc. Missing
+    # relevance values are treated as 0.0.
     sim_list = []
     for did, meta in metadata_map.items():
         meta = meta or {}
         rel = meta.get("relevance")
-        sim_list.append((did, float(rel) if rel is not None else 0.0))
+        try:
+            sim_list.append((did, float(rel) if rel is not None else 0.0))
+        except Exception:
+            sim_list.append((did, 0.0))
     sim_list.sort(key=lambda x: x[1], reverse=True)
 
-    for doc_id, rel in sim_list:
+    for doc_id, _rel in sim_list:
         meta = metadata_map.get(doc_id) or {}
-        url = _extract_url_from_metadata(meta) or ""
-        entry = {"doc_id": doc_id, "url": url, "relevance": rel}
+        url = _extract_url_from_metadata(meta)
+        if not url:
+            # Per requirement: if the url is missing, return 'private' for both
+            # title and url.
+            sources.append({"title": "private", "url": "private"})
+            continue
+
+        # Title should come from metadata when available. Fall back to
+        # a sensible value (url) if no explicit title exists.
+        title = None
         try:
             title = meta.get("title") or meta.get("heading")
-            if title:
-                entry["title"] = title
         except Exception:
-            logger.debug("Failed to extract title for doc_id %s", doc_id, exc_info=True)
-        sources.append(entry)
+            title = None
+        if not title:
+            title = url
+
+        sources.append({"title": title, "url": url})
 
     # Debug log the final source ordering for easy inspection during runs.
     try:
@@ -863,10 +874,7 @@ async def output_node(state):
     except Exception:
         logger.debug("Unable to log output sources", exc_info=True)
 
-    return {
-        "final_answer": final_answer,
-        "sources": sources,
-    }
+    return {"final_answer": final_answer, "sources": sources}
 
 # --------------------------
 # Workflow setup
