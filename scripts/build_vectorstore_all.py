@@ -92,9 +92,25 @@ def reddit_iterator(data_dir, text_splitter):
         chunks = text_splitter.split_text(content)
         for i, chunk in enumerate(chunks):
             chunk_id = f"{post_id}_chunk_{i}"
+            # Extract additional metadata fields from the original reddit JSON
+            # Include the fields the user requested: id, title, author, score, url, num_comments, created_utc
+            permalink = post.get('permalink')
+            if isinstance(permalink, str) and permalink.startswith('/'):
+                url = f"https://reddit.com{permalink}"
+            else:
+                url = post.get('url') or permalink
+            num_comments = post.get('num_comments') if post.get('num_comments') is not None else post.get('comments_count')
+            created_utc = post.get('created_utc') or post.get('created') or post.get('created_tuc')
             metadata = {
                 'source': 'reddit',
                 'parent_id': post_id,
+                'id': post_id,
+                'title': post.get('title'),
+                'author': post.get('author'),
+                'score': post.get('score'),
+                'url': url,
+                'num_comments': num_comments,
+                'created_utc': created_utc,
                 'chunk_index': i,
                 'total_chunks': len(chunks),
             }
@@ -144,7 +160,18 @@ def wikipedia_iterator(root, text_splitter):
         chunks = text_splitter.split_text(content)
         for i, chunk in enumerate(chunks):
             chunk_id = f"{pageid}_chunk_{i}"
-            metadata = {'source': 'wikipedia', 'pageid': pageid, 'title': title, 'chunk_index': i, 'total_chunks': len(chunks)}
+            # Prefer explicit URL fields if present, else fall back to curid style
+            url = page.get('fullurl') or page.get('canonicalurl') or page.get('url')
+            if not url and pageid is not None:
+                url = f"https://en.wikipedia.org/?curid={pageid}"
+            metadata = {
+                'source': 'wikipedia',
+                'pageid': pageid,
+                'title': title,
+                'url': url,
+                'chunk_index': i,
+                'total_chunks': len(chunks),
+            }
             yield {'id': chunk_id, 'content': chunk, 'metadata': metadata}
 
 
