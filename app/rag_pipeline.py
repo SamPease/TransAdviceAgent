@@ -830,9 +830,10 @@ async def output_node(state):
 
 
     metadata_map = state.get("metadata_map") or {}
+
     # Build a relevance-sorted list of sources (ordered by relevance desc).
-    # Each source is a dict with exactly the fields: 'title' and 'url'.
-    # If a document has no URL, we return both title and url as the string 'private'.
+    # Each source is a dict with the fields: 'title', 'url', and 'relevance'.
+    # If a document has no URL, set both title and url to the string 'private'.
     sources: List[dict] = []
 
     # Build list of (doc_id, relevance) and sort by relevance desc. Missing
@@ -847,13 +848,17 @@ async def output_node(state):
             sim_list.append((did, 0.0))
     sim_list.sort(key=lambda x: x[1], reverse=True)
 
-    for doc_id, _rel in sim_list:
+    # Build raw source entries (preserving relevance) in relevance order.
+    raw_sources = []
+    for doc_id, rel in sim_list:
         meta = metadata_map.get(doc_id) or {}
+        relevance = float(rel) if rel is not None else 0.0
         url = _extract_url_from_metadata(meta)
+
         if not url:
             # Per requirement: if the url is missing, return 'private' for both
             # title and url.
-            sources.append({"title": "private", "url": "private"})
+            raw_sources.append({"title": "private", "url": "private", "relevance": relevance})
             continue
 
         # Title should come from metadata when available. Fall back to
@@ -866,7 +871,17 @@ async def output_node(state):
         if not title:
             title = url
 
-        sources.append({"title": title, "url": url})
+        raw_sources.append({"title": title, "url": url, "relevance": relevance})
+
+    # Deduplicate entries while preserving relevance order. Use normalized URL
+    # as the dedupe key; treat missing/empty normalized keys as 'private'.
+    seen = set()
+    for s in raw_sources:
+        key = _normalize_url_for_dedupe(s.get("url", "")) or "private"
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append(s)
 
     # Debug log the final source ordering for easy inspection during runs.
     try:
