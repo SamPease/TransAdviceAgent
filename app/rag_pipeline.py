@@ -326,19 +326,19 @@ class SQLiteDocstore:
             # Use a single query with IN clause for better performance
             placeholders = ','.join('?' * len(ids))
             rows = self.conn.execute(
-                f"SELECT content, metadata FROM docs WHERE id IN ({placeholders})",
+                f"SELECT id, content, metadata FROM docs WHERE id IN ({placeholders})",
                 ids
             ).fetchall()
-            
-            # Create a mapping for faster lookup
-            row_map = {json.loads(metadata)["id"]: (content, metadata) 
-                      for content, metadata in rows}
-            
+
+            # Create a mapping for faster lookup by the DB id column
+            # rows are tuples (id, content, metadata)
+            row_map = {row_id: (content, metadata) for (row_id, content, metadata) in rows}
+
             # Maintain order of requested ids
             for doc_id in ids:
                 if doc_id in row_map:
                     content, metadata_json = row_map[doc_id]
-                    metadata = json.loads(metadata_json)
+                    metadata = json.loads(metadata_json) if metadata_json else {}
                     docs.append(Document(page_content=content, metadata=metadata))
                     
         return docs
@@ -458,6 +458,68 @@ def _dedupe_urls_preserve_order(urls: list) -> list:
 
 
 # --------------------------
+# Embedding helper (module-level)
+# --------------------------
+def _get_embedding_from_sql(vstore, doc_id: str) -> np.ndarray:
+    """Retrieve an embedding for a single doc id from the SQLite `Embedding` column.
+
+    This expects the `Embedding` column to exist and contain either a raw
+    float32 binary blob (bytes) or a JSON array (string). It will raise a
+    RuntimeError if the value is missing or cannot be interpreted. Prints
+    short debug info to aid tracing.
+    """
+    cur = vstore.docstore.conn.execute("SELECT Embedding FROM docs WHERE id=?", (doc_id,))
+    row = cur.fetchone()
+    if not row or row[0] is None:
+        raise RuntimeError(f"Embedding lookup failed: no Embedding column value for doc id {doc_id}")
+    raw = row[0]
+
+    # Avoid spamming raw bytes in stdout. Log a concise debug message only.
+    try:
+        logger.debug("Embedding lookup for doc_id=%s: raw type=%s", doc_id, type(raw))
+    except Exception:
+        logger.debug("Embedding lookup for doc_id=%s: raw type=<uninspectable>", doc_id)
+
+    # Case: bytes -> interpret as float32 buffer
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw_len = len(raw)
+            logger.debug("Embedding bytes length for doc_id=%s: %d bytes", doc_id, raw_len)
+        except Exception:
+            logger.debug("Embedding bytes length for doc_id=%s: <unmeasurable>", doc_id)
+        try:
+            emb_arr = np.frombuffer(raw, dtype=np.float32)
+        except Exception as exc:
+            raise RuntimeError(f"Embedding lookup failed: could not interpret raw bytes as float32 for doc id {doc_id}: {exc}")
+        try:
+            sample = emb_arr[:5].tolist()
+            logger.debug("Parsed embedding for doc_id=%s len=%d sample=%s", doc_id, emb_arr.size, sample)
+        except Exception:
+            logger.debug("Parsed embedding for doc_id=%s (unable to show float sample)", doc_id)
+        return emb_arr.astype(np.float32)
+
+    # Case: string -> try JSON
+    if isinstance(raw, str):
+        try:
+            emb_list = json.loads(raw)
+        except Exception as exc:
+            raise RuntimeError(f"Embedding lookup failed: could not parse Embedding JSON for doc id {doc_id}: {exc}")
+        try:
+            logger.debug("Parsed embedding for doc_id=%s len=%d sample=%s", doc_id, len(emb_list), emb_list[:5])
+        except Exception:
+            logger.debug("Parsed embedding for doc_id=%s (unable to show sample)", doc_id)
+        return np.array(emb_list, dtype=np.float32)
+
+    # Otherwise, assume it's a sequence-like object stored by sqlite
+    emb_list = raw
+    try:
+        logger.debug("Parsed embedding for doc_id=%s len=%d sample=%s", doc_id, len(emb_list), list(emb_list)[:5])
+    except Exception:
+        logger.debug("Parsed embedding for doc_id=%s (unable to show sample)", doc_id)
+    return np.array(emb_list, dtype=np.float32)
+
+
+# --------------------------
 # State definition
 # --------------------------
 class ChatAgentState(TypedDict, total=False):
@@ -535,7 +597,7 @@ async def retrieve_node(state):
     best_doc_id = id_map[str(best_idx)]
     selected_indices.append(best_idx)
     selected_doc_ids.append(best_doc_id)
-    best_emb = vectorstore.index.reconstruct(best_idx)
+    best_emb = _get_embedding_from_sql(vectorstore, best_doc_id)
     selected_embs.append(best_emb)
     # compute and store sim_to_query for the seeded document
     try:
@@ -551,7 +613,7 @@ async def retrieve_node(state):
     while len(selected_doc_ids) < k and remaining:
         scores = []
         for idx, doc_id in remaining:
-            emb = vectorstore.index.reconstruct(idx)
+            emb = _get_embedding_from_sql(vectorstore, doc_id)
             # Use numpy operations for similarity calculations
             try:
                 sim_to_query = float(np.dot(query_emb, emb) / (np.linalg.norm(query_emb) * np.linalg.norm(emb)))
@@ -769,53 +831,30 @@ async def output_node(state):
 
     metadata_map = state.get("metadata_map") or {}
 
-    # Build a list of (doc_id, relevance, url) directly from metadata_map so
-    # ordering is driven solely by relevance recorded at retrieval time.
-    url_entries = []
+    # Build a relevance-sorted list of sources, one per document. This ensures
+    # all retrieved documents are represented in the final `sources` output,
+    # even if some documents have no URL. Each source includes doc_id, url
+    # (may be empty), relevance, and an optional title.
+    sources = []
+    # Build list of (doc_id, relevance) and sort by relevance desc. If a
+    # relevance value is missing, treat as 0.0.
+    sim_list = []
     for did, meta in metadata_map.items():
         meta = meta or {}
         rel = meta.get("relevance")
+        sim_list.append((did, float(rel) if rel is not None else 0.0))
+    sim_list.sort(key=lambda x: x[1], reverse=True)
+
+    for doc_id, rel in sim_list:
+        meta = metadata_map.get(doc_id) or {}
         url = _extract_url_from_metadata(meta) or ""
-        url_entries.append((did, float(rel) if rel is not None else 0.0, url))
-
-    # Sort by relevance descending
-    url_entries.sort(key=lambda x: x[1], reverse=True)
-
-    # Extract urls and dedupe while preserving the relevance order
-    ordered_urls = _dedupe_urls_preserve_order([u for _, _, u in url_entries])
-
-    # Build sources and include relevance for downstream visibility
-    # Sources remain compatible with main.py (source.get('url')) but now also
-    # include 'relevance' if callers want it.
-    # We map back relevance values for the final sources list.
-    # Map each url -> relevance, keeping the first-seen relevance (highest
-    # because url_entries was sorted by relevance). This avoids overwriting
-    # a high relevance with a later lower-relevance duplicate.
-    url_to_rel = {}
-    # Also map url -> first-seen doc_id so we can lookup other metadata fields
-    # such as a title (if present) for inclusion in the final sources list.
-    url_to_docid = {}
-    for _, r, u in url_entries:
-        if u and u not in url_to_rel:
-            url_to_rel[u] = r
-            url_to_docid[u] = _
-
-    sources = []
-    for u in ordered_urls:
-        entry = {"url": u, "relevance": url_to_rel.get(u, 0.0)}
-        # Only include a 'title' key if the corresponding metadata contains one.
+        entry = {"doc_id": doc_id, "url": url, "relevance": rel}
         try:
-            doc_id = url_to_docid.get(u)
-            if doc_id:
-                meta = metadata_map.get(doc_id) or {}
-                # Accept common title keys: 'title' or 'heading'
-                title = meta.get("title") or meta.get("heading")
-                if title:
-                    entry["title"] = title
+            title = meta.get("title") or meta.get("heading")
+            if title:
+                entry["title"] = title
         except Exception:
-            # Don't fail the whole pipeline if title extraction fails; skip title.
-            logger.debug("Failed to extract title for url %s", u, exc_info=True)
-
+            logger.debug("Failed to extract title for doc_id %s", doc_id, exc_info=True)
         sources.append(entry)
 
     # Debug log the final source ordering for easy inspection during runs.
