@@ -871,7 +871,7 @@ async def output_node(state):
         if not title:
             title = url
 
-        raw_sources.append({"title": title, "url": url, "relevance": relevance})
+        raw_sources.append({"source": meta.get("source"), "title": title, "url": url, "relevance": relevance})
 
     # Deduplicate entries while preserving relevance order. Use normalized URL
     # as the dedupe key; treat missing/empty normalized keys as 'private'.
