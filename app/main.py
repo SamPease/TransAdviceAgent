@@ -39,12 +39,9 @@ async def ask(query: Query):
     try:
         result = await run_rag(query.question)
         
-        # Just extract URLs from sources
-        urls = [source.get("url", "") for source in result.get("sources", [])]
-        
         return {
             "answer": result.get("final_answer", "No answer generated"),
-            "sources": urls
+            "sources": result.get("sources", [])
         }
     except Exception as e:
         import traceback
