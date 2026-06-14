@@ -92,9 +92,9 @@ This will save files under `data/wikipedia/<category_slug>/`.
 
 ## Live Demo
 
-🌐 **[Try the live application](https://sampease.github.io/TransAdviceAgent.html)**
+🌐 **[Try the live application](https://sampease.github.io/project-writeups/trans-advice-agent/)**
 
-For a detailed technical writeup, architecture overview, and implementation details, visit the comprehensive documentation at **[sampease.github.io/TransAdviceAgent.html](https://sampease.github.io/TransAdviceAgent.html)**.
+For a detailed technical writeup, architecture overview, and implementation details, visit the comprehensive documentation at **[https://sampease.github.io/project-writeups/trans-advice-agent/](https://sampease.github.io/project-writeups/trans-advice-agent/)**.
 
 ## Important Notes
 
