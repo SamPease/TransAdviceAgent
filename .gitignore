@@ -1,4 +1,5 @@
 .DS_Store
 /.env
 /.venv
-/data__pycache__/
+/data
+__pycache__/
