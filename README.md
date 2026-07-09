@@ -57,7 +57,11 @@ The system uses a sophisticated RAG pipeline that:
 
 3. **Build the vector store** (if you have data):
    ```bash
-   python build_vectorstore.py
+   python scripts/build_vectorstore_all.py
+   ```
+   Or download the prebuilt artifacts from HuggingFace:
+   ```bash
+   python -m scripts.fetch_vectorstore --repo-id SamPease/TransAdviceAgent
    ```
 
 4. **Run the API server**:
@@ -76,19 +80,10 @@ The system uses a sophisticated RAG pipeline that:
 
 The system can ingest data from multiple sources:
 
-- **Reddit**: Use `scripts/get_reddit.py` to collect posts from r/Transgender_Surgeries
-- **WhatsApp**: Use `copy_whatsapp_chats.py` to process chat exports
-- **Text Files**: Add any `.txt` files to the `data/` directory
-
-### Fetching Wikipedia articles
-
-You can fetch Wikipedia pages by category and save each page as JSON for later processing. Example:
-
-```bash
-python scripts/fetch_wikipedia_by_category.py --categories "Transgender rights,Transgender" --max-pages 200 --depth 1 --include-subcats
-```
-
-This will save files under `data/wikipedia/<category_slug>/`.
+- **Reddit**: Use `scripts/get_reddit.py` to collect posts from r/Transgender_Surgeries and related subreddits
+- **WhatsApp**: Place chat exports in `data/WhatsApp/`; they are picked up by `scripts/build_vectorstore_all.py`
+- **Wikipedia**: Use `scripts/fetch_wikipedia_from_csv.py` with a CSV of article titles (see `data/wikipedia/download.csv`)
+- **Text/PDF files**: Use `scripts/add_vectorstore_docs_from_files.py` to chunk and insert documents into the docstore
 
 ## Live Demo
 

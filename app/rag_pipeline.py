@@ -549,12 +549,6 @@ async def retrieve_node(state):
     enhanced_query = result.content
     vectorstore = get_vectorstore()
 
-    # Quick DB check
-    conn = sqlite3.connect(VECTORSTORE_PATH + "/docs.sqlite")
-    doc_count = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
-    logger.info("Found %d documents in database", doc_count)
-    conn.close()
-
     # Load id_map for document lookup
     with open(VECTORSTORE_PATH + "/id_map.json") as f:
         id_map = json.load(f)
@@ -571,17 +565,24 @@ async def retrieve_node(state):
     candidate_indices = I[0].tolist()
     logger.info("Initial search found %d relevant documents", len(candidate_indices))
 
-    # Verify document existence
+    # Map FAISS indices to document IDs, then verify existence in SQLite.
+    # Only check the candidate ids — loading every id in the docstore into a
+    # Python set (the previous approach) rescanned the whole table per request.
+    mapped_ids = [id_map[str(idx)] for idx in candidate_indices if str(idx) in id_map]
     conn = sqlite3.connect(VECTORSTORE_PATH + "/docs.sqlite")
-    existing_ids = set(row[0] for row in conn.execute("SELECT id FROM docs").fetchall())
+    try:
+        placeholders = ",".join("?" * len(mapped_ids))
+        existing_ids = set(
+            row[0]
+            for row in conn.execute(
+                f"SELECT id FROM docs WHERE id IN ({placeholders})", mapped_ids
+            )
+        ) if mapped_ids else set()
+    finally:
+        conn.close()
+    candidate_doc_ids = [doc_id for doc_id in mapped_ids if doc_id in existing_ids]
 
-    # Map FAISS indices to document IDs
-    candidate_doc_ids = []
-    for idx in candidate_indices:
-        key = str(idx)
-        if key in id_map and id_map[key] in existing_ids:
-            candidate_doc_ids.append(id_map[key])
-    
+
     logger.info("Found %d valid documents to process", len(candidate_doc_ids))
 
     if not candidate_doc_ids:
