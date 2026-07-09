@@ -1,21 +1,29 @@
+import logging
+
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .rag_pipeline import run_rag, ensure_vectorstore_files  # your existing function
 
-app = FastAPI()
+logger = logging.getLogger(__name__)
+
+from contextlib import asynccontextmanager
 
 
-@app.on_event("startup")
-def startup_download_vectorstore():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     # Try to download vectorstore files at startup to reduce repeated wake-up downloads.
     try:
         ensure_vectorstore_files()
     except Exception:
         # Don't block startup permanently for transient HF issues; log and continue.
-        import logging
-        logging.getLogger(__name__).exception("Failed to ensure vectorstore files at startup")
+        logger.exception("Failed to ensure vectorstore files at startup")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 # --- Secure CORS setup ---
 origins = [
@@ -38,15 +46,17 @@ class Query(BaseModel):
 async def ask(query: Query):
     try:
         result = await run_rag(query.question)
-        
+
         return {
             "answer": result.get("final_answer", "No answer generated"),
             "sources": result.get("sources", [])
         }
     except Exception as e:
-        import traceback
-        print(traceback.format_exc())
-        return {"error": str(e)}
+        # Return a real error status so clients can distinguish failures from
+        # answers (previously this returned 200 with an "error" key, which the
+        # frontend silently rendered as "No answer returned").
+        logger.exception("Error handling /ask")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 # --- Health check + root route ---
 @app.get("/")
