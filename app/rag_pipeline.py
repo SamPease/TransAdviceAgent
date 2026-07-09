@@ -86,7 +86,7 @@ async def embed_query_with_retry(text: str):
 # --------------------------
 # Configurable parameters
 # --------------------------
-MODEL_NAME = "claude-3-5-haiku-latest"
+MODEL_NAME = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
 DOC_BATCH_SIZE = 10          # how many docs to fetch from FAISS per summarization step
 SUMMARY_BATCH_SIZE = 10      # how many summaries to reduce at once
 DOCS_FETCH_LIMIT = 200       # how many docs to pull from FAISS in initial search
@@ -142,11 +142,18 @@ def ensure_vectorstore_files(repo_id: str = "SamPease/TransAdviceAgent", files: 
 # --------------------------
 # Prompts
 # --------------------------
+# Pull only the prompt templates from LangSmith and bind the model here.
+# Previously we pulled with include_model=True, which baked the model choice
+# into the LangSmith prompt config — when that model was retired
+# (claude-3-5-haiku-latest), every request failed with a 404. Binding the
+# model in code keeps it under version control and easy to update.
+llm = ChatAnthropic(model=MODEL_NAME, temperature=0, max_tokens=4096)
+
 client = Client()
-enhance_prompt = client.pull_prompt("query_enhancement", include_model=True)
-map_prompt = client.pull_prompt("map_prompt", include_model=True)
-reduce_prompt = client.pull_prompt("reduce_prompt", include_model=True)
-final_prompt = client.pull_prompt("final_prompt", include_model=True)
+enhance_prompt = client.pull_prompt("query_enhancement") | llm
+map_prompt = client.pull_prompt("map_prompt") | llm
+reduce_prompt = client.pull_prompt("reduce_prompt") | llm
+final_prompt = client.pull_prompt("final_prompt") | llm
 
 # --------------------------
 # Streaming callback (optional)
@@ -822,11 +829,17 @@ async def output_node(state):
     # Final answer generation
     # --------------------------
     logger.info("Generating final answer from consolidated summary")
-    final_summary = state.get("summary").content
-
-    final_resp = await call_with_limits(lambda: final_prompt.ainvoke({"question": state["query"], "final_summary": final_summary}))
-    final_answer = getattr(final_resp, "content", final_resp)
-    logger.info("Answer generation complete")
+    summary = state.get("summary")
+    if summary is not None:
+        final_summary = getattr(summary, "content", summary)
+        final_resp = await call_with_limits(lambda: final_prompt.ainvoke({"question": state["query"], "final_summary": final_summary}))
+        final_answer = getattr(final_resp, "content", final_resp)
+        logger.info("Answer generation complete")
+    else:
+        # No summary (e.g. retrieval found no documents) — pass through any
+        # answer set upstream instead of crashing on summary.content.
+        final_answer = state.get("final_answer", "No documents found for this query.")
+        logger.info("No summary in state; skipping final answer generation")
 
 
     metadata_map = state.get("metadata_map") or {}
