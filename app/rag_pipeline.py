@@ -465,65 +465,46 @@ def _dedupe_urls_preserve_order(urls: list) -> list:
 
 
 # --------------------------
-# Embedding helper (module-level)
+# Embedding helpers (module-level)
 # --------------------------
-def _get_embedding_from_sql(vstore, doc_id: str) -> np.ndarray:
-    """Retrieve an embedding for a single doc id from the SQLite `Embedding` column.
+def _parse_embedding(raw, doc_id: str):
+    """Parse a stored `Embedding` column value (float32 blob, JSON array, or
+    sequence) into a float32 numpy array. Returns None if missing/unparseable."""
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            return np.frombuffer(raw, dtype=np.float32)
+        if isinstance(raw, str):
+            return np.array(json.loads(raw), dtype=np.float32)
+        if raw is not None:
+            return np.array(raw, dtype=np.float32)
+    except Exception:
+        logger.warning("Could not parse stored embedding for doc id %s", doc_id)
+    return None
 
-    This expects the `Embedding` column to exist and contain either a raw
-    float32 binary blob (bytes) or a JSON array (string). It will raise a
-    RuntimeError if the value is missing or cannot be interpreted. Prints
-    short debug info to aid tracing.
+
+def _get_embeddings_from_sql(vstore, doc_ids: List[str]) -> dict:
+    """Fetch embeddings for many doc ids from the SQLite `Embedding` column in
+    a single query. Returns {doc_id: np.ndarray}; ids with missing or
+    unparseable embeddings are omitted.
+
+    A few hundred 384-dim float32 vectors is well under 1 MB, so holding them
+    all for the duration of one request is cheap — much cheaper than the
+    previous approach of re-reading embeddings from SQLite on every iteration
+    of the MMR loop (~20k point queries per request).
     """
-    cur = vstore.docstore.conn.execute("SELECT Embedding FROM docs WHERE id=?", (doc_id,))
-    row = cur.fetchone()
-    if not row or row[0] is None:
-        raise RuntimeError(f"Embedding lookup failed: no Embedding column value for doc id {doc_id}")
-    raw = row[0]
-
-    # Avoid spamming raw bytes in stdout. Log a concise debug message only.
-    try:
-        logger.debug("Embedding lookup for doc_id=%s: raw type=%s", doc_id, type(raw))
-    except Exception:
-        logger.debug("Embedding lookup for doc_id=%s: raw type=<uninspectable>", doc_id)
-
-    # Case: bytes -> interpret as float32 buffer
-    if isinstance(raw, (bytes, bytearray)):
-        try:
-            raw_len = len(raw)
-            logger.debug("Embedding bytes length for doc_id=%s: %d bytes", doc_id, raw_len)
-        except Exception:
-            logger.debug("Embedding bytes length for doc_id=%s: <unmeasurable>", doc_id)
-        try:
-            emb_arr = np.frombuffer(raw, dtype=np.float32)
-        except Exception as exc:
-            raise RuntimeError(f"Embedding lookup failed: could not interpret raw bytes as float32 for doc id {doc_id}: {exc}")
-        try:
-            sample = emb_arr[:5].tolist()
-            logger.debug("Parsed embedding for doc_id=%s len=%d sample=%s", doc_id, emb_arr.size, sample)
-        except Exception:
-            logger.debug("Parsed embedding for doc_id=%s (unable to show float sample)", doc_id)
-        return emb_arr.astype(np.float32)
-
-    # Case: string -> try JSON
-    if isinstance(raw, str):
-        try:
-            emb_list = json.loads(raw)
-        except Exception as exc:
-            raise RuntimeError(f"Embedding lookup failed: could not parse Embedding JSON for doc id {doc_id}: {exc}")
-        try:
-            logger.debug("Parsed embedding for doc_id=%s len=%d sample=%s", doc_id, len(emb_list), emb_list[:5])
-        except Exception:
-            logger.debug("Parsed embedding for doc_id=%s (unable to show sample)", doc_id)
-        return np.array(emb_list, dtype=np.float32)
-
-    # Otherwise, assume it's a sequence-like object stored by sqlite
-    emb_list = raw
-    try:
-        logger.debug("Parsed embedding for doc_id=%s len=%d sample=%s", doc_id, len(emb_list), list(emb_list)[:5])
-    except Exception:
-        logger.debug("Parsed embedding for doc_id=%s (unable to show sample)", doc_id)
-    return np.array(emb_list, dtype=np.float32)
+    if not doc_ids:
+        return {}
+    placeholders = ",".join("?" * len(doc_ids))
+    with vstore.docstore.lock:
+        rows = vstore.docstore.conn.execute(
+            f"SELECT id, Embedding FROM docs WHERE id IN ({placeholders})", doc_ids
+        ).fetchall()
+    out = {}
+    for doc_id, raw in rows:
+        emb = _parse_embedding(raw, doc_id)
+        if emb is not None:
+            out[doc_id] = emb
+    return out
 
 
 # --------------------------
@@ -589,61 +570,47 @@ async def retrieve_node(state):
         logger.debug("No valid document IDs found!")
         return {"doc_ids": [], "metadata_map": {}, "query": query}
 
-    # ---- Memory-efficient MMR ----
+    # ---- MMR reranking (vectorized) ----
+    # Fetch all candidate embeddings with one query and keep them as a single
+    # (n, dim) float32 matrix (~0.3 MB for 200 candidates), instead of
+    # re-reading embeddings from SQLite inside the selection loop.
     logger.debug("Starting MMR reranking...")
     lambda_mult = 0.7
-    k = min(DOCS_KEEP_LIMIT, len(candidate_doc_ids))
-    logger.debug("Will select top %d documents from %d candidates", k, len(candidate_doc_ids))
 
-    selected_indices = []
-    selected_doc_ids = []
-    selected_embs = []
-    selected_sims = []
+    emb_map = _get_embeddings_from_sql(vectorstore, candidate_doc_ids)
+    query_vec = np.asarray(query_emb, dtype=np.float32)
+    dim = query_vec.shape[0]
+    ids = [d for d in candidate_doc_ids if d in emb_map and emb_map[d].shape == (dim,)]
+    dropped = len(candidate_doc_ids) - len(ids)
+    if dropped:
+        logger.warning("Dropped %d candidates with missing/malformed embeddings", dropped)
+    if not ids:
+        logger.warning("No candidate embeddings available for this query")
+        return {"doc_ids": [], "metadata_map": {}, "query": query}
 
-    # Seed with best match
-    best_idx = candidate_indices[0]
-    best_doc_id = id_map[str(best_idx)]
-    selected_indices.append(best_idx)
-    selected_doc_ids.append(best_doc_id)
-    best_emb = _get_embedding_from_sql(vectorstore, best_doc_id)
-    selected_embs.append(best_emb)
-    # compute and store sim_to_query for the seeded document
-    try:
-        sim_best = float(np.dot(query_emb, best_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(best_emb)))
-    except Exception:
-        sim_best = None
-    selected_sims.append(sim_best)
+    k = min(DOCS_KEEP_LIMIT, len(ids))
+    logger.debug("Will select top %d documents from %d candidates", k, len(ids))
 
-    # Remove it from candidates
-    remaining = [(idx, id_map[str(idx)]) for idx in candidate_indices[1:]
-                if str(idx) in id_map]
+    # Unit-normalize once so every cosine similarity below is a plain dot product.
+    E = np.stack([emb_map[d] for d in ids])
+    E /= np.maximum(np.linalg.norm(E, axis=1, keepdims=True), 1e-12)
+    q = query_vec / max(float(np.linalg.norm(query_vec)), 1e-12)
+    sim_to_query = E @ q
 
-    while len(selected_doc_ids) < k and remaining:
-        scores = []
-        for idx, doc_id in remaining:
-            emb = _get_embedding_from_sql(vectorstore, doc_id)
-            # Use numpy operations for similarity calculations
-            try:
-                sim_to_query = float(np.dot(query_emb, emb) / (np.linalg.norm(query_emb) * np.linalg.norm(emb)))
-            except Exception:
-                sim_to_query = None
-            sim_to_selected = max(np.dot(emb, sel_emb) / (np.linalg.norm(emb) * np.linalg.norm(sel_emb))
-                                for sel_emb in selected_embs)
-            mmr_score = (lambda_mult * sim_to_query) - ((1 - lambda_mult) * sim_to_selected) if sim_to_query is not None else -999.0
-            # store sim_to_query alongside candidate so we can reuse it when selected
-            scores.append((mmr_score, idx, doc_id, emb, sim_to_query))
-        
-        if not scores:
-            break
+    # Seed with the best FAISS match (ids preserve FAISS ranking order), then
+    # greedily add the candidate with the highest MMR score. The similarity to
+    # the selected set is updated incrementally, so the loop is O(k * n * dim).
+    selected = [0]
+    max_sim_to_selected = E @ E[0]
+    while len(selected) < k:
+        mmr = lambda_mult * sim_to_query - (1 - lambda_mult) * max_sim_to_selected
+        mmr[selected] = -np.inf
+        nxt = int(np.argmax(mmr))
+        selected.append(nxt)
+        max_sim_to_selected = np.maximum(max_sim_to_selected, E @ E[nxt])
 
-        _, idx, doc_id, emb, sim_selected = max(scores, key=lambda x: x[0])
-        selected_indices.append(idx)
-        selected_doc_ids.append(doc_id)
-        selected_embs.append(emb)
-        selected_sims.append(sim_selected)
-        # print(f"[DEBUG][retrieve] Selected: index={idx}, doc_id={doc_id}, mmr_score={_:.4f}")
-        remaining = [(i, d) for (i, d) in remaining if d != doc_id]
-
+    selected_doc_ids = [ids[i] for i in selected]
+    selected_sims = [float(sim_to_query[i]) for i in selected]
     logger.debug("Final selection: %d documents", len(selected_doc_ids))
 
     # Load metadata from SQLite
@@ -656,55 +623,38 @@ async def retrieve_node(state):
         else:
             logger.warning("Could not find document %s in SQLite", doc_id)
 
-    # --- Compute similarity to query and provide both MMR selection order and
-    #     a pure-relevance sort. MMR selects diverse items; if you need
-    #     strict relevance ordering we sort by sim_to_query here before
-    #     returning results. ---
+    # --- Provide both the MMR selection order (logged) and a strict
+    #     relevance-sorted ordering (returned). MMR selects diverse items;
+    #     downstream consumers want doc ids sorted by similarity to the query. ---
     try:
-        # Build sim_list from stored sims collected during MMR selection to avoid
-        # recomputing similarity a second time.
         sim_list = list(zip(selected_doc_ids, selected_sims))
 
         # Log top N in the MMR-chosen order (how they were selected)
         top_n = min(10, len(sim_list))
         logger.info("Top %d retrieved documents (MMR selection order):", top_n)
-        top_ids_mmr = [doc_id for doc_id, _ in sim_list[:top_n]]
-        top_docs_mmr = vectorstore.docstore.get_by_ids(top_ids_mmr)
+        top_docs_mmr = vectorstore.docstore.get_by_ids([d for d, _ in sim_list[:top_n]])
         for (doc_id, sim), doc in zip(sim_list[:top_n], top_docs_mmr):
             url = None
             if doc and getattr(doc, "metadata", None):
                 url = doc.metadata.get("url") or doc.metadata.get("permalink")
-            logger.info("  %s  score=%s  url=%s", doc_id, f"{sim:.4f}" if sim is not None else "<err>", url)
+            logger.info("  %s  score=%.4f  url=%s", doc_id, sim, url)
 
-        # Now produce a strict relevance-sorted ordering (descending sim)
-        sorted_by_relevance = sorted([t for t in sim_list if t[1] is not None], key=lambda x: x[1], reverse=True)
-        # If some sims are None, append them at the end in original order
-        none_sims = [t for t in sim_list if t[1] is None]
-        sorted_by_relevance.extend(none_sims)
-
-        # Reorder selected_doc_ids and selected_embs to be relevance-sorted for return
-        relevance_ordered_ids = [doc_id for doc_id, _ in sorted_by_relevance]
-        id_to_emb = {doc_id: emb for doc_id, emb in zip(selected_doc_ids, selected_embs)}
-        selected_doc_ids = relevance_ordered_ids
-        selected_embs = [id_to_emb.get(did) for did in selected_doc_ids]
+        # Strict relevance-sorted ordering (descending sim) for the return value
+        sorted_by_relevance = sorted(sim_list, key=lambda x: x[1], reverse=True)
+        selected_doc_ids = [doc_id for doc_id, _ in sorted_by_relevance]
 
         # Attach relevance scores into metadata_map so downstream nodes can use them
-        # Use 0.0 for None sims to keep a numeric field available.
         for doc_id, sim in sim_list:
-            try:
-                metadata_map.setdefault(doc_id, {})["relevance"] = float(sim) if sim is not None else 0.0
-            except Exception:
-                metadata_map.setdefault(doc_id, {})["relevance"] = 0.0
+            metadata_map.setdefault(doc_id, {})["relevance"] = float(sim)
 
         # Log top N in the relevance-sorted order for easy comparison
         logger.info("Top %d retrieved documents (relevance-sorted):", top_n)
-        top_ids_rel = [doc_id for doc_id, _ in sorted_by_relevance[:top_n]]
-        top_docs_rel = vectorstore.docstore.get_by_ids(top_ids_rel)
+        top_docs_rel = vectorstore.docstore.get_by_ids([d for d, _ in sorted_by_relevance[:top_n]])
         for (doc_id, sim), doc in zip(sorted_by_relevance[:top_n], top_docs_rel):
             url = None
             if doc and getattr(doc, "metadata", None):
                 url = doc.metadata.get("url") or doc.metadata.get("permalink")
-            logger.info("  %s  score=%s  url=%s", doc_id, f"{sim:.4f}" if sim is not None else "<err>", url)
+            logger.info("  %s  score=%.4f  url=%s", doc_id, sim, url)
     except Exception:
         logger.debug("Failed to compute/log relevance list", exc_info=True)
 
